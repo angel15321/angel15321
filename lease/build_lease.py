@@ -1,8 +1,8 @@
-"""Generate the Hidalgo Property Management LLC fillable residential lease
+"""Generate the Hidalgo Two LLC fillable residential lease
 (Arizona) and the landlord's new-tenant checklist.
 
 Usage:  python3 lease/build_lease.py
-Output: lease/Hidalgo_Residential_Lease.pdf
+Output: lease/Hidalgo_Two_Residential_Lease.pdf
         lease/Landlord_New_Tenant_Checklist.pdf
 """
 import io
@@ -15,7 +15,10 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfgen import canvas
 from reportlab.platypus import Paragraph
 
-COMPANY = "HIDALGO PROPERTY MANAGEMENT LLC"
+COMPANY = "HIDALGO TWO LLC"
+COMPANY_NAME = "Hidalgo Two LLC"
+COMPANY_ADDR = "6602 South Mitchell Dr., Tempe, Arizona 85283"
+COMPANY_PHONE = "(480) 318-2379"
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PAGE_W, PAGE_H = letter
@@ -235,14 +238,15 @@ def lease(d: Doc):
     d.row([("Name:", "owner_name", None)])
     d.row([("Address:", "owner_addr", None)])
     d.para("<b>Property Manager</b> (authorized to manage the Premises and to act for the Landlord):")
-    d.ensure(18)
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(LM, d.y - 10, "Company:")
-    c.setFont("Helvetica", 9)
-    c.drawString(LM + 48, d.y - 10, "Hidalgo Property Management LLC")
-    d.y -= 18
-    d.row([("Address:", "pm_addr", None)])
-    d.row([("Phone:", "pm_phone", 150), ("Email:", "pm_email", None)])
+    for label, value in (("Company:", COMPANY_NAME), ("Address:", COMPANY_ADDR),
+                         ("Phone:", COMPANY_PHONE)):
+        d.ensure(18)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(LM, d.y - 10, label)
+        c.setFont("Helvetica", 9)
+        c.drawString(LM + 52, d.y - 10, value)
+        d.y -= 18
+    d.row([("Email:", "pm_email", None)])
     d.para("The Property Manager named above is authorized to receive notices, demands and "
            "service of process for the Landlord. If no Property Manager is named, the Owner "
            "receives them at the Owner address above.", after=4)
@@ -467,16 +471,19 @@ def lease(d: Doc):
            "to restore the Premises from any unapproved change.")
 
     # 18 insurance
-    d.section("18. Renter’s Insurance (Required)")
-    d.row([("Tenant must carry renter’s insurance with personal liability coverage of at least $",
-            "ins_min", None)])
-    d.para("for the entire tenancy and give Landlord proof of coverage <b>before receiving keys</b> and "
-           "at each renewal. Landlord should be listed as an “interested party” so the "
-           "insurer notifies Landlord if the policy is cancelled. Landlord’s insurance does "
-           "<b>not</b> cover Tenant’s belongings or Tenant’s liability. Except for losses "
-           "caused by Landlord’s negligence, Tenant is responsible for injury, loss, or damage "
-           "caused by Tenant, occupants, guests, or pets. Failure to keep insurance is a material "
-           "noncompliance.")
+    d.section("18. Insurance")
+    d.para("<b>Landlord’s insurance:</b> Landlord insures the building and Landlord’s property. "
+           "Landlord’s policy does <b>not</b> cover Tenant’s belongings, vehicles, or "
+           "Tenant’s liability.")
+    d.para("<b>Renter’s insurance (required):</b> Tenant must carry, at Tenant’s own cost, a "
+           "renter’s insurance policy covering Tenant’s personal belongings and personal liability "
+           "for the entire tenancy, and give Landlord proof of coverage <b>before receiving keys</b> and "
+           "at each renewal. Landlord should be listed as an “interested party” so the insurer "
+           "notifies Landlord if the policy is cancelled. Except for losses caused by Landlord’s "
+           "negligence, Tenant is responsible for loss of Tenant’s belongings and for injury or "
+           "damage caused by Tenant, occupants, guests, or pets. Failure to keep renter’s insurance "
+           "is a material noncompliance.")
+    d.row([("Minimum personal liability coverage (optional): $", "ins_min", 110)])
     d.row([("Insurance company:", "ins_co", 230), ("Policy #:", "ins_policy", None)])
 
     # 19 conduct
@@ -596,7 +603,7 @@ def lease(d: Doc):
     d.space(4)
     for i in range(1, 5):
         d.signature_block(f"Tenant {i}", f"sig_t{i}")
-    d.signature_block("Landlord / Authorized Agent of " + "Hidalgo Property Management LLC", "sig_l")
+    d.signature_block("Landlord / Authorized Agent of " + COMPANY_NAME, "sig_l")
 
 
 def attachment_a(d: Doc):
@@ -749,7 +756,7 @@ def build_checklist(path):
                 "Screening criteria applied the same way to every applicant (fair housing).",
                 "Assistance-animal requests handled separately — no pet fee or pet deposit charged for them.",
                 "Owner name and address filled in (Section 1 — required by A.R.S. § 33-1322).",
-                "Property Manager address, phone, and email filled in.",
+                "Company email filled in (Section 1) until it is printed on the form.",
                 "Every adult listed as a Tenant; all other occupants (including children) listed in Section 3.",
             ]),
             ("Money", [
@@ -817,7 +824,7 @@ def build_checklist(path):
 
 
 if __name__ == "__main__":
-    lp = os.path.join(OUT_DIR, "Hidalgo_Residential_Lease.pdf")
+    lp = os.path.join(OUT_DIR, "Hidalgo_Two_Residential_Lease.pdf")
     cp = os.path.join(OUT_DIR, "Landlord_New_Tenant_Checklist.pdf")
     print("lease pages:", build_lease(lp))
     print("checklist pages:", build_checklist(cp))
