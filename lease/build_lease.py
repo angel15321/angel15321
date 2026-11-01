@@ -2,7 +2,8 @@
 (Arizona) and the landlord's new-tenant checklist.
 
 Usage:  python3 lease/build_lease.py
-Output: lease/Hidalgo_Two_Residential_Lease.pdf
+Output: lease/Hidalgo_Two_Residential_Lease.pdf          (fillable on screen)
+        lease/Hidalgo_Two_Residential_Lease_PRINT.pdf    (print and fill by hand)
         lease/Landlord_New_Tenant_Checklist.pdf
 """
 import io
@@ -39,7 +40,8 @@ BULLET = ParagraphStyle("bullet", parent=BODY, leftIndent=14, bulletIndent=4)
 class Doc:
     """Tiny flowing-layout engine on a reportlab canvas with AcroForm fields."""
 
-    def __init__(self, stream, title, total_pages=None, footer=True):
+    def __init__(self, stream, title, total_pages=None, footer=True, printable=False):
+        self.printable = printable  # True: plain lines/boxes for handwriting, no form fields
         self.c = canvas.Canvas(stream, pagesize=letter)
         self.c.setTitle(title)
         self.c.setAuthor(COMPANY)
@@ -100,6 +102,22 @@ class Doc:
         return f"{base}_{self.n}"
 
     def text_field(self, name, x, y, w, h, size=9, multiline=False, value=""):
+        if self.printable:
+            c = self.c
+            c.saveState()
+            c.setStrokeColor(black)
+            c.setLineWidth(0.5)
+            if multiline:
+                c.rect(x, y, w, h, stroke=1, fill=0)
+                ly = y + h - 16
+                c.setStrokeColor(HexColor("#999999"))
+                while ly > y + 4:
+                    c.line(x + 4, ly, x + w - 4, ly)
+                    ly -= 16
+            else:
+                c.line(x, y + 1, x + w, y + 1)
+            c.restoreState()
+            return
         self.c.acroForm.textfield(
             name=name, x=x, y=y, width=w, height=h, fontName="Helvetica",
             fontSize=0 if multiline else size, borderStyle="underlined",
@@ -108,6 +126,14 @@ class Doc:
             fieldFlags="multiline" if multiline else "")
 
     def checkbox(self, name, x, y, size=9, checked=False):
+        if self.printable:
+            c = self.c
+            c.saveState()
+            c.setStrokeColor(black)
+            c.setLineWidth(0.6)
+            c.rect(x, y, size, size, stroke=1, fill=0)
+            c.restoreState()
+            return
         self.c.acroForm.checkbox(
             name=name, x=x, y=y, size=size, buttonStyle="check",
             borderColor=FIELD_BORDER, fillColor=FIELD_FILL, textColor=black,
@@ -718,9 +744,10 @@ def attachment_b(d: Doc):
     d.signature_block("Landlord / Agent", "mf_out_l")
 
 
-def build_lease(path):
+def build_lease(path, printable=False):
     def render(stream, total):
-        d = Doc(stream, "Residential Lease Agreement (Arizona)", total_pages=total)
+        d = Doc(stream, "Residential Lease Agreement (Arizona)", total_pages=total,
+                printable=printable)
         lease(d)
         attachment_a(d)
         attachment_b(d)
@@ -737,9 +764,10 @@ def build_lease(path):
 #  LANDLORD CHECKLIST (internal — do not give to tenant)
 # =====================================================================
 
-def build_checklist(path):
+def build_checklist(path, printable=False):
     def render(stream, total):
-        d = Doc(stream, "Landlord New-Tenant Checklist (internal)", total_pages=total, footer=False)
+        d = Doc(stream, "Landlord New-Tenant Checklist (internal)", total_pages=total,
+                footer=False, printable=printable)
         c = d.c
         c.setFont("Helvetica-Bold", 15)
         c.setFillColor(ACCENT)
@@ -828,3 +856,8 @@ if __name__ == "__main__":
     cp = os.path.join(OUT_DIR, "Landlord_New_Tenant_Checklist.pdf")
     print("lease pages:", build_lease(lp))
     print("checklist pages:", build_checklist(cp))
+    # Print versions: plain black lines and boxes for filling out by hand.
+    print("print lease pages:", build_lease(
+        os.path.join(OUT_DIR, "Hidalgo_Two_Residential_Lease_PRINT.pdf"), printable=True))
+    print("print checklist pages:", build_checklist(
+        os.path.join(OUT_DIR, "Landlord_New_Tenant_Checklist_PRINT.pdf"), printable=True))
