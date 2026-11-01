@@ -1,0 +1,3 @@
+# Only needed for --live trading; scanning and dry runs use the standard library.
+cryptography>=42
+polymarket-client>=0.15

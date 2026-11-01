@@ -1,4 +1,9 @@
 __pycache__/
 *.pyc
-arb-scanner/report.html
-arb-scanner/arbs.json
+*.db
+*.log
+*.html
+arb-scanner/*.json
+.env
+*.pem
+STOP
