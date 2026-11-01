@@ -57,6 +57,12 @@ Fill in `.env` with:
 - **Polymarket US:** a Key ID and Secret Key from **polymarket.us/developer**
   (sign in the same way as in the app; the secret is shown only once).
 
+**Recommended: a Kalshi subaccount of its own.** If the same Kalshi account runs another
+bot, `tools/kalshi_subaccount_setup.py` (run where that account's key already lives) creates
+a numbered subaccount, moves a set amount into it, and generates an API key locked to it. The
+arb bot then trades only that cash, and the key cannot move money or touch the rest of the
+account. It does nothing without `--execute` and never retries a transfer.
+
 Then load the keys and check that both accounts connect. This places no orders.
 
 bash:
