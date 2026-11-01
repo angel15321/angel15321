@@ -1,20 +1,33 @@
-"""Polymarket adapter: NFL moneyline, spread and total markets + CLOB books."""
+"""Polymarket US adapter: NFL moneyline and full-game spread markets + order books.
+
+Everything here is the PUBLIC gateway (gateway.polymarket.us); no key needed.
+
+Polymarket US lists ONE instrument per market (the YES / "long" side). Buying
+NO is a short of that instrument, so each market yields two contracts here:
+
+    long   pays when the market's outcome happens     (buy  = ORDER_INTENT_BUY_LONG)
+    short  pays when it does not                      (buy  = ORDER_INTENT_BUY_SHORT)
+
+A short ask at p is a long bid at 1-p, so one order book prices both.
+NFL totals are not listed on Polymarket US (11-2026), so only moneylines and
+full-game spreads are mapped; half/quarter spreads have no Kalshi match.
+"""
 from __future__ import annotations
 
+import concurrent.futures as cf
 import datetime as dt
-import json
 import time
 
 from . import http
 from .fees import poly_model
-from .model import Book, Contract, Game, margin_contract_label, total_label
-from .teams import from_code, from_name
+from .model import Book, Contract, Game, margin_contract_label
+from .teams import from_code
 
-GAMMA = "https://gamma-api.polymarket.com"
-CLOB = "https://clob.polymarket.com"
-NFL_SERIES = "12185"
+GATEWAY = "https://gateway.polymarket.us"
 VENUE = "Polymarket"
-KINDS = {"moneyline": "ml", "spreads": "spread", "totals": "total"}
+KINDS = {"football_team_full_game_winner": "ml", "football_team_full_game_spread": "spread"}
+EVENT_TTL = 600          # seconds to cache each game's market list (lines rarely change)
+_events: dict[str, tuple[float, list[dict]]] = {}
 
 
 def _f(x) -> float | None:
@@ -24,114 +37,160 @@ def _f(x) -> float | None:
         return None
 
 
-def fetch_books(token_ids: list[str]) -> dict[str, dict]:
-    out = {}
-    for i in range(0, len(token_ids), 400):
-        for b in http.post(f"{CLOB}/books", [{"token_id": t} for t in token_ids[i:i + 400]]):
-            out[b["asset_id"]] = b
+def _levels(rows: list[dict]) -> list[tuple[float, float]]:
+    out = []
+    for x in rows or []:
+        p, q = _f((x.get("px") or {}).get("value")), _f(x.get("qty"))
+        if p is not None and q:
+            out.append((p, q))
     return out
 
 
-def _books_for(raw: dict) -> tuple[Book, Book, float, float]:
-    """Outcome-0 book -> (book0, book1, min_size, tick). The two outcome
-    books mirror each other: an outcome-0 bid at p is an outcome-1 ask at 1-p."""
+def _events_for_league() -> list[dict]:
+    """Every NFL game event with its start time and live flag (markets fetched per event)."""
+    out, offset = [], 0
+    while True:
+        d = http.get(f"{GATEWAY}/v2/leagues/nfl/events", {"limit": 100, "offset": offset})
+        page = d.get("events") or []
+        out += [e for e in page if str(e.get("slug", "")).startswith("nfl-")]
+        if len(page) < 100:
+            return out
+        offset += 100
+
+
+def _event_markets(slug: str) -> list[dict]:
+    hit = _events.get(slug)
+    if hit and time.time() - hit[0] < EVENT_TTL:
+        return hit[1]
+    ms = (http.get(f"{GATEWAY}/v1/events/slug/{slug}").get("event") or {}).get("markets") or []
+    ms = [m for m in ms if m.get("sportsMarketType") in KINDS]
+    _events[slug] = (time.time(), ms)
+    return ms
+
+
+def fetch_book(slug: str) -> tuple[Book, Book]:
+    """(long book, short book). A market that is not open for trading gets empty books."""
+    md = http.get(f"{GATEWAY}/v1/markets/{slug}/book").get("marketData") or {}
     now = time.time()
-    asks = sorted((float(x["price"]), float(x["size"])) for x in raw.get("asks", []))
-    bids = sorted(((float(x["price"]), float(x["size"])) for x in raw.get("bids", [])), reverse=True)
-    b0 = Book(asks=asks, bids=bids, fetched_at=now)
-    b1 = Book(asks=[(round(1 - p, 4), s) for p, s in bids], bids=[(round(1 - p, 4), s) for p, s in asks],
-              fetched_at=now)
-    return b0, b1, _f(raw.get("min_order_size")) or 5.0, _f(raw.get("tick_size")) or 0.01
+    if md.get("state") not in (None, "MARKET_STATE_OPEN"):
+        return Book(fetched_at=now), Book(fetched_at=now)
+    offers = sorted(_levels(md.get("offers")))
+    bids = sorted(_levels(md.get("bids")), reverse=True)
+    long = Book(asks=offers, bids=bids, fetched_at=now)
+    short = Book(asks=[(round(1 - p, 4), s) for p, s in bids], bids=[(round(1 - p, 4), s) for p, s in offers],
+                 fetched_at=now)
+    return long, short
+
+
+def _safe_book(slug: str):
+    try:
+        return fetch_book(slug)
+    except Exception:
+        return None
+
+
+def fetch_books(slugs: list[str]) -> dict[str, tuple[Book, Book]]:
+    out = {}
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        for slug, books in zip(slugs, ex.map(_safe_book, slugs)):
+            if books:
+                out[slug] = books
+    return out
+
+
+def _teams(event: dict, m: dict) -> tuple[str, str] | None:
+    """(away, home). Market sides carry `ordering`; else the slug is nfl-away-home-date."""
+    order = {}
+    for s in m.get("marketSides") or []:
+        t = s.get("team") or {}
+        code = from_code(t.get("abbreviation") or "")
+        if code and t.get("ordering") in ("away", "home"):
+            order[t["ordering"]] = code
+    if "away" in order and "home" in order:
+        return order["away"], order["home"]
+    parts = event["slug"].split("-")
+    a, h = from_code(parts[1]), from_code(parts[2])
+    return (a, h) if a and h else None
+
+
+def parse_event(e: dict, markets: list[dict], fee_override: float | None = None) -> tuple[Game | None, list[Contract]]:
+    """One NFL event + its markets -> (Game, contracts without books)."""
+    start = dt.datetime.fromisoformat(e["startTime"].replace("Z", "+00:00")) if e.get("startTime") else None
+    g, out = None, []
+    for m in markets:
+        kind = KINDS.get(m.get("sportsMarketType"))
+        if not kind or m.get("closed") or not m.get("active", True):
+            continue
+        teams = _teams(e, m)
+        long_side = next((s for s in m.get("marketSides") or [] if s.get("long")), None)
+        if not teams or not long_side:
+            continue
+        away, home = teams
+        t = from_code((long_side.get("team") or {}).get("abbreviation") or "")
+        if t not in (away, home):
+            continue
+        if g is None:
+            g = Game(away, home, start)
+            g.links[VENUE] = f"https://polymarket.us/event/{e['slug']}"
+        if kind == "ml":
+            s_long, line = ("gt" if t == home else "lt"), 0.0
+        else:
+            ln = _f(m.get("line"))
+            if ln is None or ln == int(ln):
+                continue
+            # long = team t covers `ln`, i.e. wins by more than -ln
+            need = -ln
+            s_long, line = ("gt", need) if t == home else ("lt", -need)
+        s_short = "lt" if s_long == "gt" else "gt"
+        fee = poly_model(m, fee_override)
+        for side, s in ((s_long, "long"), (s_short, "short")):
+            out.append(Contract(
+                venue=VENUE, game=g.key, axis="margin", side=side, line=line, kind=kind, tie_half=kind == "ml",
+                label=margin_contract_label(g, side, line, kind),
+                how=f"{'BUY_LONG' if s == 'long' else 'BUY_SHORT'} on \"{m.get('question')}\"",
+                fee=fee, url=g.links[VENUE], min_size=_f(m.get("minimumTradeQty")) or 1.0,
+                tick=_f(m.get("orderPriceMinTickSize")) or 0.01,
+                ref={"ticker": m["slug"], "slug": m["slug"], "side": s, "market_id": m.get("id"),
+                     "event": e["slug"], "live": bool(e.get("live"))}))
+    return g, out
 
 
 def fetch(horizon: dt.datetime, fee_override: float | None = None) -> dict[str, Game]:
-    events = http.get(f"{GAMMA}/events", {"series_id": NFL_SERIES, "closed": "false", "limit": 300})
     now = dt.datetime.now(dt.timezone.utc)
     games: dict[str, Game] = {}
-    pending: list[tuple[Contract, int, str]] = []   # (contract, outcome index, token0)
-
-    for e in events:
-        parts = e.get("slug", "").split("-")       # nfl-kc-den-2026-11-01
-        if len(parts) < 4 or parts[0] != "nfl":
-            continue
-        away, home = from_code(parts[1]), from_code(parts[2])
-        if not away or not home:
-            continue
+    contracts: list[Contract] = []
+    for e in _events_for_league():
         start = dt.datetime.fromisoformat(e["startTime"].replace("Z", "+00:00")) if e.get("startTime") else None
         if start and (start > horizon or start < now - dt.timedelta(hours=5)):
             continue
-        g = games.setdefault(f"{away}@{home}", Game(away, home, start))
-        g.links[VENUE] = f"https://polymarket.com/event/{e['slug']}"
-
-        for m in e.get("markets", []):
-            kind = KINDS.get(m.get("sportsMarketType"))
-            if not kind or m.get("closed") or not m.get("acceptingOrders", True):
-                continue
-            outcomes = json.loads(m.get("outcomes") or "[]")
-            tokens = json.loads(m.get("clobTokenIds") or "[]")
-            if len(outcomes) != 2 or len(tokens) != 2:
-                continue
-            fee = poly_model(m, fee_override)
-            common = dict(venue=VENUE, game=g.key, fee=fee, url=g.links[VENUE],
-                          volume_24h=_f(m.get("volume24hr")))
-            specs: list[tuple[str, float, str, bool]] = []   # per outcome: side, line, kind, tie_half
-            if kind == "ml":
-                for o in outcomes:
-                    t = from_name(o)
-                    if t not in (away, home):
-                        break
-                    specs.append(("gt" if t == home else "lt", 0.0, "ml", True))
-            elif kind == "spread":
-                line = _f(m.get("line"))
-                t = from_name(outcomes[0])
-                if line is None or line == int(line) or t not in (away, home):
-                    continue
-                # outcome 0: team t wins by more than -line
-                need = -line
-                s0, l0 = ("gt", need) if t == home else ("lt", -need)
-                specs = [(s0, l0, "spread", False), ("lt" if s0 == "gt" else "gt", l0, "spread", False)]
-            else:
-                line = _f(m.get("line"))
-                if line is None or line == int(line) or [o.lower() for o in outcomes] != ["over", "under"]:
-                    continue
-                specs = [("gt", line, "total", False), ("lt", line, "total", False)]
-            if len(specs) != 2:
-                continue
-            for idx, (side, line, k, tie) in enumerate(specs):
-                axis = "total" if k == "total" else "margin"
-                label = total_label(side, line) if axis == "total" else margin_contract_label(g, side, line, k)
-                c = Contract(axis=axis, side=side, line=line, kind=k, tie_half=tie, label=label,
-                             how=f"buy '{outcomes[idx]}' on \"{m.get('question')}\"",
-                             ref={"token_id": tokens[idx], "token0": tokens[0], "outcome": idx,
-                                  "market_id": m.get("id"), "seconds_delay": m.get("secondsDelay") or 0},
-                             **common)
-                pending.append((c, idx, tokens[0]))
-
-    raw = fetch_books(sorted({t0 for _, _, t0 in pending}))
-    for c, idx, t0 in pending:
-        if t0 in raw:
-            b0, b1, min_size, tick = _books_for(raw[t0])
-            c.book = b0 if idx == 0 else b1
-            c.min_size, c.tick = min_size, tick
+        g, cs = parse_event(e, _event_markets(e["slug"]), fee_override)
+        if g:
+            games.setdefault(g.key, g).links.update(g.links)
+            contracts += cs
+    books = fetch_books(sorted({c.ref["slug"] for c in contracts}))
+    for c in contracts:
+        pair = books.get(c.ref["slug"])
+        if pair:
+            c.book = pair[0] if c.ref["side"] == "long" else pair[1]
         games[c.game].contracts.append(c)
     return games
 
 
-def settlement(market_id: str, outcome: int) -> float | None:
-    """Payout per share for `outcome` once resolved, else None."""
-    m = http.get(f"{GAMMA}/markets/{market_id}")
-    if not m.get("closed"):
+def settlement(slug: str, side: str) -> float | None:
+    """Payout per contract for `side` ('long'/'short') once settled, else None."""
+    try:
+        d = http.get(f"{GATEWAY}/v1/markets/{slug}/settlement")
+    except Exception:
+        return None          # 404 until the market settles
+    v = _f(d.get("settlement"))
+    if v not in (0.0, 0.5, 1.0):
         return None
-    prices = [_f(p) for p in json.loads(m.get("outcomePrices") or "[]")]
-    # Only trust final prices (1/0, or 0.5/0.5 for a tie or cancellation).
-    if len(prices) != 2 or any(p not in (0.0, 0.5, 1.0) for p in prices):
-        return None
-    return prices[outcome]
+    return v if side == "long" else 1 - v
 
 
 def refresh(contracts: list[Contract]) -> None:
-    raw = fetch_books(sorted({c.ref["token0"] for c in contracts}))
+    books = fetch_books(sorted({c.ref["slug"] for c in contracts}))
     for c in contracts:
-        if c.ref["token0"] in raw:
-            b0, b1, _, _ = _books_for(raw[c.ref["token0"]])
-            c.book = b0 if c.ref["outcome"] == 0 else b1
+        if c.ref["slug"] in books:
+            long, short = books[c.ref["slug"]]
+            c.book = long if c.ref["side"] == "long" else short

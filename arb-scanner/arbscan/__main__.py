@@ -32,7 +32,8 @@ def cmd_run(a):
     cfg = trader.Config(
         live=a.live, max_per_trade=a.max_per_trade, max_daily_spend=a.max_daily, max_open=a.max_open,
         min_roi=a.min_roi, min_profit=a.min_profit, slippage=a.slippage, hedge_attempts=a.hedge_attempts,
-        on_fail=a.on_fail, cooldown_min=a.cooldown, include_live_games=a.include_live_games,
+        on_fail=a.on_fail, cooldown_min=a.cooldown, include_live_games=a.include_live_games or a.in_play_only,
+        in_play_only=a.in_play_only, leg1=a.leg1,
         cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file)
     log = _log_to(a.log)
     try:
@@ -44,12 +45,13 @@ def cmd_run(a):
         bal = {v: b.balance() for v, b in brokers.items()}
         log("=" * 72)
         log("LIVE TRADING — real orders will be placed.")
-        log(f"Balances: Kalshi ${bal['Kalshi']:,.2f} · Polymarket ${bal['Polymarket']:,.2f}")
+        log(f"Balances: Kalshi ${bal['Kalshi']:,.2f} · Polymarket US ${bal['Polymarket']:,.2f}")
     else:
         log("DRY RUN — fills are simulated against live order books; nothing is sent. Add --live to trade.")
     log(f"Limits: ${cfg.max_per_trade:,.0f}/arb · ${cfg.max_daily_spend:,.0f}/day · ${cfg.max_open:,.0f} open · "
         f"min ROI {cfg.min_roi * 100:.2f}% · min profit ${cfg.min_profit:.2f} · on failed hedge: {cfg.on_fail} · "
-        f"{'pre-game + live games' if cfg.include_live_games else 'pre-game only'}")
+        f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
+        f" · leg 1: {cfg.leg1}")
     log(f"Stop: Ctrl-C, or create a file named '{cfg.kill_file}' here. Ledger: {a.db}")
     try:
         trader.run(db, cfg, brokers, a.days, a.interval, once=a.once, log=log)
@@ -61,7 +63,7 @@ def cmd_run(a):
 def cmd_check(a):
     ok = True
     for name, make in (("Kalshi", lambda: __import__("arbscan.brokers", fromlist=["x"]).KalshiBroker(demo=a.kalshi_demo)),
-                       ("Polymarket", lambda: __import__("arbscan.brokers", fromlist=["x"]).PolymarketBroker())):
+                       ("Polymarket US", lambda: __import__("arbscan.brokers", fromlist=["x"]).PolymarketBroker())):
         try:
             b = make()
             print(f"✔ {name}: connected, available ${b.balance():,.2f}")
@@ -108,7 +110,7 @@ def cmd_liquidity(a):
 
 def cmd_fees(a):
     k = fees.kalshi_model(None, None)
-    p = fees.FeeModel("Polymarket", a.poly_rate, round_fee_to=0.00001)
+    p = fees.FeeModel("Polymarket", a.poly_rate, round_fee_to=0.01)
     print(f"Kalshi taker:     {k.describe()}")
     print(f"Polymarket taker: {p.describe()}  (makers pay 0)\n")
     print(f"{'price':>6} {'Kalshi/100':>11} {'%':>6} {'Poly/100':>9} {'%':>6} {'pair break-even':>16}")
@@ -118,8 +120,12 @@ def cmd_fees(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="arbscan", description="Automated NFL arbitrage between Kalshi and Polymarket "
-                                 "(moneyline, spreads, totals).")
+    # Windows consoles default to cp1252, which cannot print the arrows/checkmarks/¢ used below.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    ap = argparse.ArgumentParser(prog="arbscan", description="Automated NFL arbitrage between Kalshi and Polymarket US "
+                                 "(moneylines and full-game spreads).")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="auto-arb loop (dry run unless --live)")
@@ -135,6 +141,10 @@ def main(argv=None):
                    help="if leg 2 can't fill: sell leg 1 back (default) or keep it")
     r.add_argument("--include-live-games", action="store_true",
                    help="also trade games already in progress (fastest-moving, highest legging risk)")
+    r.add_argument("--in-play-only", action="store_true",
+                   help="ONLY games in progress; scans just those games, so pair it with a short --interval")
+    r.add_argument("--leg1", choices=["auto", "polymarket", "kalshi"], default="auto",
+                   help="which venue's leg to buy first; auto = the stale venue in-play, else Polymarket")
     r.add_argument("--cross-venue-only", action="store_true")
     r.add_argument("--cooldown", type=float, default=10, help="minutes before re-taking the same pair")
     r.add_argument("--max-failures", type=int, default=2, help="halt after N failed hedges in a row")
@@ -167,7 +177,7 @@ def main(argv=None):
     lq.set_defaults(fn=cmd_liquidity)
 
     f = sub.add_parser("fees", help="fee formulas and tables")
-    f.add_argument("--poly-rate", type=float, default=0.03)
+    f.add_argument("--poly-rate", type=float, default=0.0695)
     f.set_defaults(fn=cmd_fees)
 
     a = ap.parse_args(argv)

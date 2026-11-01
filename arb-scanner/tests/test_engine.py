@@ -6,24 +6,25 @@ import datetime as dt
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from arbscan import engine, fees, kalshi  # noqa: E402
+from arbscan import engine, fees, kalshi, polymarket  # noqa: E402
 from arbscan.model import Book, Contract, Game  # noqa: E402
 from arbscan.teams import from_code, from_name  # noqa: E402
 
 K = fees.kalshi_model("quadratic_with_maker_fees", 1)
-P = fees.FeeModel("Polymarket", 0.03, round_fee_to=0.00001)
+P = fees.poly_model({"feeCoefficient": 0.0695})
 FREE = fees.FeeModel("Free", 0.0)
 
 
-def c(venue, axis, side, line, asks, fee=FREE, kind="spread", tie=False, tid=None, min_size=1):
+def c(venue, axis, side, line, asks, fee=FREE, kind="spread", tie=False, tid=None, min_size=1, pm_side="long"):
+    slug = tid or f"asc-nfl-kc-den-{side}{line}"
     return Contract(venue=venue, game="KC@DEN", axis=axis, side=side, line=line, kind=kind,
                     label=f"{side}{line}", how="", fee=fee, tie_half=tie, min_size=min_size,
                     ref={"ticker": tid or f"{venue}{side}{line}", "side": "yes"} if venue == "Kalshi"
-                    else {"token_id": tid or f"t{side}{line}", "token0": tid or f"t0{side}{line}",
-                          "outcome": 0, "market_id": "m"},
+                    else {"ticker": slug, "slug": slug, "side": pm_side, "market_id": "m"},
                     book=Book(asks=asks))
 
 
@@ -43,11 +44,12 @@ class FeeTests(unittest.TestCase):
         n, f = K.order_total([(0.50, 1)])
         self.assertAlmostEqual(n + f, 0.52)
 
-    def test_polymarket_matches_docs_table(self):
-        # Docs (sports rate 0.05): 100 shares @ 50c -> $1.25; @ 10c -> $0.45
-        p5 = fees.FeeModel("Polymarket", 0.05, round_fee_to=0.00001)
-        self.assertAlmostEqual(p5.order_total([(0.50, 100)])[1], 1.25)
-        self.assertAlmostEqual(p5.order_total([(0.10, 100)])[1], 0.45)
+    def test_polymarket_us_matches_docs(self):
+        # docs.polymarket.us/fees: 100-lot @ 50c -> $1.74, @ 1c -> $0.07, @ 97c -> $0.20 (cent rounding)
+        self.assertAlmostEqual(P.order_total([(0.50, 100)])[1], 1.74)
+        self.assertAlmostEqual(P.order_total([(0.01, 100)])[1], 0.07)
+        self.assertAlmostEqual(P.order_total([(0.97, 100)])[1], 0.20)
+        self.assertAlmostEqual(fees.poly_model({}).rate, 0.0695)
 
     def test_symmetric(self):
         self.assertAlmostEqual(P.per_contract(0.3), P.per_contract(0.7))
@@ -123,6 +125,68 @@ class SizingTests(unittest.TestCase):
         a = c("Kalshi", "total", "gt", 44.5, [(0.40, 10)], tid="X")
         b = c("Kalshi", "total", "lt", 44.5, [(0.40, 10)], tid="X")
         self.assertEqual(engine.find([game(a, b)])[0], [])
+        a = c("Polymarket", "margin", "gt", 0.0, [(0.40, 10)], tid="S", kind="ml", tie=True)
+        b = c("Polymarket", "margin", "lt", 0.0, [(0.40, 10)], tid="S", kind="ml", tie=True, pm_side="short")
+        self.assertEqual(engine.find([game(a, b)])[0], [])
+
+
+def _side(abbr, long, ordering=None):
+    return {"long": long, "team": {"abbreviation": abbr, "ordering": ordering}}
+
+
+class PolymarketUSParseTests(unittest.TestCase):
+    EVENT = {"slug": "nfl-kc-den-2026-11-01", "startTime": "2026-11-01T21:25:00Z", "live": True}
+
+    def test_moneyline_long_is_listed_team(self):
+        m = {"slug": "aec-nfl-kc-den-2026-11-01", "sportsMarketType": "football_team_full_game_winner",
+             "active": True, "closed": False, "feeCoefficient": 0.0695, "minimumTradeQty": 0.01,
+             "orderPriceMinTickSize": 0.0025, "marketSides": [_side("kc", True, "away"), _side("den", False, "home")]}
+        g, cs = polymarket.parse_event(self.EVENT, [m])
+        self.assertEqual(g.key, "KC@DEN")
+        by = {x.ref["side"]: x for x in cs}
+        # long = KC (away) wins -> home margin < 0; short = DEN wins
+        self.assertEqual((by["long"].side, by["long"].line, by["long"].label), ("lt", 0.0, "KC ML"))
+        self.assertEqual((by["short"].side, by["short"].label), ("gt", "DEN ML"))
+        self.assertTrue(by["long"].tie_half)
+        self.assertEqual((by["long"].tick, by["long"].min_size), (0.0025, 0.01))
+        self.assertTrue(by["long"].ref["live"])
+
+    def test_spread_line_maps_to_margin(self):
+        # "Will KC cover -6.5" (KC away): KC wins by > 6.5 -> home margin < -6.5
+        m = {"slug": "asc-nfl-kc-den-2026-11-01-neg-6pt5", "sportsMarketType": "football_team_full_game_spread",
+             "line": -6.5, "active": True, "closed": False,
+             "marketSides": [_side("kc", True), _side("den", False)]}
+        _, cs = polymarket.parse_event(self.EVENT, [m])
+        by = {x.ref["side"]: x for x in cs}
+        self.assertEqual((by["long"].side, by["long"].line, by["long"].label), ("lt", -6.5, "KC -6.5"))
+        self.assertEqual((by["short"].side, by["short"].label), ("gt", "DEN +6.5"))
+
+    def test_half_game_and_whole_lines_skipped(self):
+        half = {"slug": "x", "sportsMarketType": "football_team_first_half_spread", "line": -3.5,
+                "marketSides": [_side("kc", True), _side("den", False)]}
+        whole = {"slug": "y", "sportsMarketType": "football_team_full_game_spread", "line": -3.0,
+                 "marketSides": [_side("kc", True), _side("den", False)]}
+        self.assertEqual(polymarket.parse_event(self.EVENT, [half, whole])[1], [])
+
+    def test_book_mirrors_long_into_short_and_skips_closed(self):
+        book = {"marketData": {"state": "MARKET_STATE_OPEN",
+                               "bids": [{"px": {"value": "0.40"}, "qty": "100"}, {"px": {"value": "0.39"}, "qty": "5"}],
+                               "offers": [{"px": {"value": "0.42"}, "qty": "50"}]}}
+        with mock.patch("arbscan.http.get", return_value=book):
+            long, short = polymarket.fetch_book("s")
+        self.assertEqual(long.asks, [(0.42, 50.0)])
+        self.assertEqual(short.asks, [(0.6, 100.0), (0.61, 5.0)])
+        self.assertEqual(short.bids, [(0.58, 50.0)])
+        book["marketData"]["state"] = "MARKET_STATE_SUSPENDED"
+        with mock.patch("arbscan.http.get", return_value=book):
+            self.assertEqual(polymarket.fetch_book("s")[0].asks, [])
+
+    def test_settlement_sides(self):
+        with mock.patch("arbscan.http.get", return_value={"slug": "s", "settlement": 1}):
+            self.assertEqual(polymarket.settlement("s", "long"), 1.0)
+            self.assertEqual(polymarket.settlement("s", "short"), 0.0)
+        with mock.patch("arbscan.http.get", side_effect=RuntimeError("404")):
+            self.assertIsNone(polymarket.settlement("s", "long"))
 
 
 class TeamTests(unittest.TestCase):

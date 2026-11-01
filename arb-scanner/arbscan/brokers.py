@@ -6,18 +6,17 @@ Every broker exposes the same three calls:
     sell(contract, qty, min_price)           -> Fill   # immediate-or-cancel, reduce only
     balance()                                -> float  # available cash in $
 
-Nothing ever rests on a book: Kalshi orders are `immediate_or_cancel`,
-Polymarket orders are Fill-And-Kill market orders with a price bound.
+Nothing ever rests on a book: Kalshi orders are `immediate_or_cancel`, and
+Polymarket US orders are immediate-or-cancel limit orders (anything the
+exchange reports as still open afterwards is cancelled).
 
 Credentials (live mode only) come from environment variables:
 
     KALSHI_API_KEY_ID              Kalshi → Account & security → API Keys
     KALSHI_PRIVATE_KEY_PATH        path to the downloaded .pem (or KALSHI_PRIVATE_KEY = PEM text)
 
-    POLYMARKET_PRIVATE_KEY         signer private key
-    POLYMARKET_WALLET_ADDRESS      account wallet (polymarket.com profile menu)
-    POLYMARKET_RELAYER_API_KEY     polymarket.com → Settings → API Keys → Relayer
-    POLYMARKET_RELAYER_API_KEY_ADDRESS
+    POLYMARKET_KEY_ID              polymarket.us/developer → Create API key → Key ID
+    POLYMARKET_SECRET_KEY          the Secret Key shown once at creation (base64)
 """
 from __future__ import annotations
 
@@ -36,6 +35,7 @@ from .model import Contract
 
 KALSHI_TRADE_API = "https://external-api.kalshi.com/trade-api/v2"
 KALSHI_DEMO_API = "https://external-api.demo.kalshi.co/trade-api/v2"
+POLY_US_API = "https://api.polymarket.us"
 
 
 @dataclass
@@ -98,9 +98,8 @@ class PaperBroker:
         return self.cash
 
     def _wait(self, c: Contract) -> None:
-        delay = self.latency + (c.ref.get("seconds_delay", 0) or 0)
-        if delay:
-            time.sleep(delay)
+        if self.latency:
+            time.sleep(self.latency)
         scanner.refresh([c])
 
     def buy(self, c: Contract, qty: float, limit: float, notional_hint: float | None = None) -> Fill:
@@ -224,81 +223,126 @@ class KalshiBroker:
         return self._order(c, "sell", qty, max(0.01, min_price))
 
 
-# ---------------------------------------------------------------- Polymarket
+# ---------------------------------------------------------------- Polymarket US
+
+def ceil_to(x: float, step: float) -> float:
+    return math.ceil(round(x / step, 6)) * step
+
 
 class PolymarketBroker:
+    """Polymarket US (api.polymarket.us). One instrument per market: buying the
+    contract's `long` side is ORDER_INTENT_BUY_LONG, its `short` side (NO) is
+    ORDER_INTENT_BUY_SHORT. Order prices are ALWAYS the YES price, also for
+    NO orders, so a NO bought for at most q is a YES sale at no less than 1-q."""
     venue = "Polymarket"
+    done = ("ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED", "ORDER_STATE_EXPIRED")
 
-    def __init__(self):
+    def __init__(self, key_id: str | None = None, secret_key_b64: str | None = None, base: str = POLY_US_API):
         try:
-            from polymarket import RelayerApiKey, SecureClient
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         except ImportError as e:  # pragma: no cover
-            raise RuntimeError("live Polymarket trading needs `pip install polymarket-client`") from e
-        need = ["POLYMARKET_PRIVATE_KEY", "POLYMARKET_WALLET_ADDRESS"]
-        missing = [k for k in need if not os.environ.get(k)]
-        if missing:
-            raise RuntimeError("set " + ", ".join(missing))
-        api_key = None
-        if os.environ.get("POLYMARKET_RELAYER_API_KEY"):
-            api_key = RelayerApiKey(key=os.environ["POLYMARKET_RELAYER_API_KEY"],
-                                    address=os.environ.get("POLYMARKET_RELAYER_API_KEY_ADDRESS", ""))
-        self.client = SecureClient.create(private_key=os.environ["POLYMARKET_PRIVATE_KEY"],
-                                          wallet=os.environ["POLYMARKET_WALLET_ADDRESS"], api_key=api_key)
+            raise RuntimeError("live Polymarket trading needs `pip install cryptography`") from e
+        self.key_id = key_id or os.environ.get("POLYMARKET_KEY_ID")
+        secret = secret_key_b64 or os.environ.get("POLYMARKET_SECRET_KEY")
+        if not self.key_id or not secret:
+            raise RuntimeError("set POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY (polymarket.us/developer)")
+        # The secret is base64; the Ed25519 seed is its first 32 bytes.
+        self.key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(secret)[:32])
+        self.base = base
+
+    def _sign(self, method: str, path: str) -> dict:
+        ts = str(int(time.time() * 1000))
+        sig = self.key.sign(f"{ts}{method}{path.split('?')[0]}".encode())
+        return {"X-PM-Access-Key": self.key_id, "X-PM-Timestamp": ts,
+                "X-PM-Signature": base64.b64encode(sig).decode()}
+
+    def _req(self, method: str, path: str, body: dict | None = None) -> dict:
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "User-Agent": "nfl-arbscan/2.0", **self._sign(method, path)}
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
+                                     headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            raise RuntimeError(f"Polymarket {method} {path} → HTTP {e.code}: {detail}") from None
 
     def balance(self) -> float:
-        b = self.client.get_balance_allowance(asset_type="COLLATERAL")
-        return b.balance / 1e6
+        b = (self._req("GET", "/v1/account/balances").get("balances") or [{}])[0]
+        return float(b.get("buyingPower") or 0)
 
-    def _settle(self, resp, c: Contract, action: str, wait: float = 8.0) -> Fill:
-        if not getattr(resp, "ok", False):
-            return Fill(self.venue, action, c.label, status="rejected",
-                        error=f"{getattr(resp, 'code', '')} {getattr(resp, 'message', '')}".strip())
-        oid = resp.order_id
-        making, taking = float(resp.making_amount or 0), float(resp.taking_amount or 0)
-        status = (resp.status or "").lower()
-        # Sports markets apply a matching delay: the order is accepted as
-        # "delayed" and matches after it. Poll until it is no longer pending.
-        deadline = time.time() + wait
-        while status in ("delayed", "live") and time.time() < deadline:
-            time.sleep(0.4)
+    def _order(self, c: Contract, action: str, qty: float, yes_px: float, intent: str) -> Fill:
+        tick = c.tick or 0.01
+        yes_px = min(max(round(yes_px, 4), tick), 1 - tick)
+        body = {"marketSlug": c.ref["slug"], "intent": intent, "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": f"{yes_px:.4f}", "currency": "USD"}, "quantity": floor_to(qty, 0.01),
+                "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+                "synchronousExecution": True, "maxBlockTime": "5"}
+        try:
+            r = self._req("POST", "/v1/orders", body)
+        except Exception as e:
+            return Fill(self.venue, action, c.label, status="error", error=str(e))
+        return self._result(c, action, r, body)
+
+    def _result(self, c: Contract, action: str, r: dict, body: dict) -> Fill:
+        oid = r.get("id", "")
+        execs = r.get("executions") or []
+        order = next((x["order"] for x in reversed(execs) if x.get("order")), None)
+        rejected = next((x for x in execs if x.get("type") == "EXECUTION_TYPE_REJECTED"), None)
+        if order is None or order.get("state") not in self.done:
+            order = self._final(oid, c) or order or {}
+        state = order.get("state", "")
+        filled = float(order.get("cumQuantity") or 0)
+        if not filled:
+            fills = [(float(x["lastPx"]["value"]), float(x.get("lastShares") or 0)) for x in execs
+                     if x.get("type") in ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL") and x.get("lastPx")]
+            filled = sum(q for _, q in fills)
+            avg_yes = sum(p * q for p, q in fills) / filled if filled else 0.0
+        else:
+            avg_yes = float((order.get("avgPx") or {}).get("value") or 0)
+        if not filled:
+            err = ""
+            if rejected:
+                err = f"{rejected.get('orderRejectReason', '')} {rejected.get('text', '')}".strip()
+            return Fill(self.venue, action, c.label, order_id=oid, status="rejected" if rejected else "no fill",
+                        error=err, raw={"state": state, "request_price": body["price"]["value"]})
+        holds_long = c.ref["side"] == "long"
+        avg = avg_yes if holds_long else 1 - avg_yes
+        fee_v = (order.get("commissionNotionalTotalCollected") or {}).get("value")
+        fee = float(fee_v) if fee_v not in (None, "") else c.fee.fill_fee(avg, filled)
+        return Fill(self.venue, action, c.label, filled, avg, fee, oid, "filled",
+                    raw={"state": state, "avg_yes": avg_yes, "request_price": body["price"]["value"],
+                         "intent": body["intent"]})
+
+    def _final(self, oid: str, c: Contract, wait: float = 3.0) -> dict | None:
+        """Poll an order that came back without a final state; cancel anything left open."""
+        if not oid:
+            return None
+        deadline, o = time.time() + wait, None
+        while time.time() < deadline:
             try:
-                o = self.client.get_order(order_id=oid)
+                o = self._req("GET", f"/v1/order/{oid}").get("order") or {}
             except Exception:
-                continue
-            status = (o.status or "").lower()
-            matched = float(o.size_matched or 0)
-            if matched:
-                taking = matched if action == "buy" else taking
-                making = matched * float(o.price) if action == "buy" else matched
-            if status not in ("delayed", "live", "unmatched"):
-                break
-        if status in ("delayed", "live"):
-            try:
-                self.client.cancel_order(order_id=oid)  # never leave anything resting
-            except Exception:
-                pass
-        # BUY: making = USDC paid, taking = shares. SELL: making = shares, taking = USDC.
-        shares, usdc = (taking, making) if action == "buy" else (making, taking)
-        if shares <= 0:
-            return Fill(self.venue, action, c.label, order_id=oid, status=status or "no fill")
-        avg = usdc / shares
-        return Fill(self.venue, action, c.label, shares, avg, c.fee.fill_fee(avg, shares), oid, status,
-                    raw={"status": status, "making": making, "taking": taking})
+                o = None
+            if o and o.get("state") in self.done:
+                return o
+            time.sleep(0.25)
+        try:
+            self._req("POST", f"/v1/order/{oid}/cancel", {"marketSlug": c.ref["slug"]})  # never leave anything resting
+        except Exception:
+            pass
+        return o
 
     def buy(self, c: Contract, qty: float, limit: float, notional_hint: float | None = None) -> Fill:
-        spend = round(notional_hint if notional_hint else qty * limit, 2)
-        try:
-            resp = self.client.place_market_order(asset_id=c.ref["token_id"], side="BUY", amount=f"{spend:.2f}",
-                                                  max_price=f"{limit:.4f}", order_type="FAK")
-        except Exception as e:
-            return Fill(self.venue, "buy", c.label, status="error", error=f"{type(e).__name__}: {e}")
-        return self._settle(resp, c, "buy")
+        tick = c.tick or 0.01
+        if c.ref["side"] == "long":
+            return self._order(c, "buy", qty, floor_to(limit, tick), "ORDER_INTENT_BUY_LONG")
+        return self._order(c, "buy", qty, ceil_to(1 - limit, tick), "ORDER_INTENT_BUY_SHORT")
 
     def sell(self, c: Contract, qty: float, min_price: float) -> Fill:
-        try:
-            resp = self.client.place_market_order(asset_id=c.ref["token_id"], side="SELL",
-                                                  shares=f"{floor_to(qty, 0.01):.2f}",
-                                                  min_price=f"{max(0.001, min_price):.4f}", order_type="FAK")
-        except Exception as e:
-            return Fill(self.venue, "sell", c.label, status="error", error=f"{type(e).__name__}: {e}")
-        return self._settle(resp, c, "sell")
+        tick = c.tick or 0.01
+        min_price = max(tick, min_price)
+        if c.ref["side"] == "long":
+            return self._order(c, "sell", qty, ceil_to(min_price, tick), "ORDER_INTENT_SELL_LONG")
+        return self._order(c, "sell", qty, floor_to(1 - min_price, tick), "ORDER_INTENT_SELL_SHORT")

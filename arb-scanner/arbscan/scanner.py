@@ -67,4 +67,4 @@ def settlement(c_ref: dict, venue: str) -> float | None:
         if yes is None:
             return None
         return yes if c_ref["side"] == "yes" else 1 - yes
-    return polymarket.settlement(c_ref["market_id"], c_ref["outcome"])
+    return polymarket.settlement(c_ref["slug"], c_ref["side"])

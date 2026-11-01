@@ -9,10 +9,10 @@ Kalshi (docs.kalshi.com, series `fee_type` = quadratic / quadratic_with_maker_fe
     Net effect for a normal account: the order's total outlay rounds UP to the
     next cent.
 
-Polymarket (docs.polymarket.com/trading/fees)
-    taker fee = C x feeRate x p x (1 - p)        makers pay nothing
-    feeRate comes from each market's `feeSchedule` (NFL markets currently 0.03;
-    the docs' generic sports rate is 0.05). Fees round to 5 decimals.
+Polymarket US (docs.polymarket.us/fees)
+    taker fee = Θ x C x p x (1 - p)              Θ = 0.0695 (each market's `feeCoefficient`)
+    p is the YES trade price (the formula is symmetric, so a NO buy pays the same).
+    Each fill's fee rounds to $0.01. Tier-1 makers get no rebate.
 
 Both fees peak at p = 0.50 and fall to ~0 at the extremes, so an arb whose
 legs are priced near 50c needs the biggest raw edge to survive fees.
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 KALSHI_TAKER = 0.07
 KALSHI_MAKER = 0.0175
-POLY_DEFAULT_SPORTS_RATE = 0.05
+POLY_US_TAKER = 0.0695
 
 
 def _ceil(x: float, step: float) -> float:
@@ -77,14 +77,8 @@ def kalshi_model(fee_type: str | None, multiplier: float | None,
 
 
 def poly_model(market: dict, override: float | None = None) -> FeeModel:
-    if override is not None:
-        return FeeModel("Polymarket", override, round_fee_to=0.00001)
-    if not market.get("feesEnabled"):
-        return FeeModel("Polymarket", 0.0)
-    sched = market.get("feeSchedule") or {}
-    rate = sched.get("rate", POLY_DEFAULT_SPORTS_RATE)
-    expo = sched.get("exponent", 1) or 1
-    return FeeModel("Polymarket", float(rate), float(expo), round_fee_to=0.00001)
+    rate = override if override is not None else market.get("feeCoefficient")
+    return FeeModel("Polymarket", float(POLY_US_TAKER if rate is None else rate), round_fee_to=0.01)
 
 
 def fee_table(model: FeeModel, prices=(0.05, 0.10, 0.20, 0.30, 0.40, 0.50,

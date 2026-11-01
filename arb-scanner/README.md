@@ -1,8 +1,9 @@
-# NFL Auto-Arb — Kalshi × Polymarket
+# NFL Auto-Arb — Kalshi × Polymarket US
 
-A bot that finds **arbitrage between Kalshi and Polymarket on NFL moneylines,
-spreads and totals** and **executes both legs automatically**, with exact
-venue fees, order-book-aware sizing, and hard risk limits.
+A bot that finds **arbitrage between Kalshi and Polymarket US on NFL moneylines
+and full-game spreads** and **executes both legs automatically**, with exact
+venue fees, order-book-aware sizing, and hard risk limits. It can trade
+pre-game, in-play, or both.
 
 **It starts in dry-run mode.** It runs every step against live order books
 but sends no orders until you add `--live`.
@@ -12,23 +13,28 @@ cd arb-scanner
 ```
 
 ```bash
-python3 -m arbscan run
+python -m arbscan run
 ```
+
+(On macOS/Linux use `python3`.)
 
 ## How a trade happens
 
-1. **Scan** (every 15 s). It pulls every NFL moneyline, spread and total on both venues
-   (about 4,500 contracts) with full order books in about 5 s.
+1. **Scan** (every 15 s, or `--interval`). It pulls every NFL moneyline and full-game
+   spread on both venues with full order books. Polymarket US is one book request per
+   market, so a 1-day scan takes ~12 s; in-play-only scans only the games in progress.
 2. **Find.** It pairs any two contracts that together pay at least $1 on every possible
-   score (same line on two venues, middles like Over 44.5 + Under 45.5, moneyline vs
+   score (same line on two venues, middles like KC -2.5 + DEN +3.5, moneyline vs
    spread). A pair counts only if it still profits after both venues' taker fees.
 3. **Size.** It walks both order books to the largest profitable size, then caps that
    by your limits and the cash on each venue.
-4. **Leg 1: Polymarket.** Polymarket sports markets match after a 1 s delay, so this
-   leg goes first and the bot waits for the confirmed fill. It's a Fill-And-Kill
-   order with a max price, so nothing rests on the book.
-5. **Leg 2: Kalshi.** It buys exactly what leg 1 filled, as an immediate-or-cancel
-   order capped at the **break-even price**, and retries up to 3 times.
+4. **Leg 1.** The leg most likely to vanish goes first, as an immediate-or-cancel order
+   with a max price, so nothing rests on the book. **In a game in progress** that is the
+   **stale** venue: after a score one venue reprices first and the other's old quotes get
+   pulled, so the leg whose price moved least since the last scan goes first. Pre-game
+   (or with no history yet) the Polymarket leg goes first. `--leg1 polymarket|kalshi` forces it.
+5. **Leg 2.** It buys exactly what leg 1 filled, as an immediate-or-cancel order capped
+   at the **break-even price**, and retries up to 3 times.
 6. **If the hedge fails,** it sells leg 1 back (`--on-fail unwind`, the default) or
    keeps it (`--on-fail hold`).
 7. **Log and settle.** Every order goes into `trades.db` and `arbscan.log`. After
@@ -48,23 +54,37 @@ Fill in `.env` with:
 
 - **Kalshi:** your API key ID and the path to the `.pem` file you downloaded.
   Get them at kalshi.com → Account & security → API Keys.
-- **Polymarket:** the signer private key, your wallet address, and a Relayer API
-  key. Get them at polymarket.com → Settings → API Keys.
+- **Polymarket US:** a Key ID and Secret Key from **polymarket.us/developer**
+  (sign in the same way as in the app; the secret is shown only once).
 
-Then load the keys and check that both accounts connect. This places no orders:
+Then load the keys and check that both accounts connect. This places no orders.
+
+bash:
 
 ```bash
 set -a && . ./.env && set +a
 ```
 
+PowerShell:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=' } | ForEach-Object { $k, $v = $_ -split '=', 2; Set-Item "env:$k" $v }
+```
+
 ```bash
-python3 -m arbscan check
+python -m arbscan check
 ```
 
 Run the dry run for a while first. Once its results look right, go live with small limits:
 
 ```bash
-python3 -m arbscan run --live --max-per-trade 50 --max-daily 200
+python -m arbscan run --live --max-per-trade 20 --max-daily 25
+```
+
+In-play only, scanning faster:
+
+```bash
+python -m arbscan run --live --in-play-only --interval 3 --max-per-trade 20 --max-daily 25
 ```
 
 `--kalshi-demo` sends the Kalshi side to Kalshi's demo exchange instead.
@@ -79,63 +99,70 @@ python3 -m arbscan run --live --max-per-trade 50 --max-daily 200
 | Max $ in unsettled trades | $1,000 | `--max-open` |
 | Minimum ROI after fees | 0.5% | `--min-roi` |
 | Minimum $ locked per arb | $0.25 | `--min-profit` |
-| Pre-game only (no in-play) | on | `--include-live-games` |
+| Pre-game only (no in-play) | on | `--include-live-games` / `--in-play-only` |
+| Leg order | stale venue first in-play | `--leg1` |
 | Failed hedge → sell leg 1 back | unwind | `--on-fail hold` |
 | Halt after N failed hedges in a row | 2 | `--max-failures` |
 | Don't re-take the same pair for | 10 min | `--cooldown` |
 | Kill switch | create a file named `STOP` | `--kill-file` |
 | Balance check before every trade | always | |
-| Orders never rest on a book | always (IOC / FAK) | |
+| Orders never rest on a book | always (IOC) | |
+| Paused/suspended Polymarket US market | treated as an empty book | |
 
-**Why pre-game only by default.** In a 4-minute paper test during live games,
-the bot saw 4 arbs. One hedged (+$0.52), one was gone within a second, and **two
-left a leg unhedged**, because the second venue's price moved before the hedge
-reached it. In-play arbs are the most common, but also by far the riskiest.
+**In-play is where the arbs are, and where hedges fail.** On 2026-11-01, a public-data
+watch of the Sunday slate found every profitable window in-play, right after scores, each
+gone within ~20 s; none pre-game. A failed hedge is sold back at a loss (fees in and out
+plus the spread), so keep `--max-per-trade` small and let `--max-failures` halt the bot.
 
 ## Other commands
 
 | Command | |
 | --- | --- |
-| `python3 -m arbscan status` | Settle finished games and print the ledger and P&L |
-| `python3 -m arbscan scan` | One scan: current arbs and the closest misses |
-| `python3 -m arbscan liquidity` | Bid/ask, spread and $ depth within 2¢ for each game's main lines |
-| `python3 -m arbscan fees` | Fee formulas and tables for both venues |
+| `python -m arbscan status` | Settle finished games and print the ledger and P&L |
+| `python -m arbscan scan` | One scan: current arbs and the closest misses |
+| `python -m arbscan liquidity` | Bid/ask, spread and $ depth within 2¢ for each game's main lines |
+| `python -m arbscan fees` | Fee formulas and tables for both venues |
 
 ## Fees (from each venue's docs, applied to every decision)
 
 | | Taker fee | Notes |
 | --- | --- | --- |
 | Kalshi | `0.07 × C × p × (1−p)` | Read live from each series. A regular account's order outlay rounds **up** to the cent. |
-| Polymarket | `rate × C × p × (1−p)` | `rate` comes from each market (NFL currently **0.03**). Makers pay 0. |
+| Polymarket US | `0.0695 × C × p × (1−p)` | Read from each market's `feeCoefficient`. Each fill's fee rounds to the cent. Tier-1 makers get no rebate. |
 
-Both peak at 50¢. A 50¢/50¢ pair needs **2.5¢ of raw edge** just to break even;
-a 90¢/10¢ pair needs 0.9¢.
+Both peak at 50¢. A 50¢/50¢ pair needs **~3.5¢ of raw edge** just to break even;
+a 90¢/10¢ pair needs ~1.3¢.
 
 ## Things to know
 
-- **Polymarket fees on fills are estimated** with the published formula. The
-  share count comes from the actual fill, so realized P&L uses what you really got.
-- **Redeeming on Polymarket.** Winning Polymarket shares may need to be redeemed
-  to turn back into cash. Kalshi pays out automatically.
+- **Polymarket US has one instrument per market.** Buying "the other team" or NO is a
+  short (`ORDER_INTENT_BUY_SHORT`); its order price is always the YES price, so the bot
+  sends 1 − your NO limit. It costs the same buying power as buying NO.
+- **What's covered.** Polymarket US lists NFL moneylines and spreads (full game, halves,
+  quarters) but no totals. Only moneylines and full-game spreads have a Kalshi match.
+- **Rate limit.** Polymarket US allows 25 requests/s per IP, shared by data and orders; the
+  bot keeps its public reads to ~16/s.
 - **Cash sits on both venues** until settlement. Keep both accounts funded; the
   smaller balance limits each arb's size.
-- **Legality.** Kalshi is CFTC-regulated and US-only. Whether you can use
-  Polymarket depends on where you live. Check both venues' terms.
-- **No guarantee.** Arbs are rare and short-lived, and a failed hedge costs fees
-  (about $1.50 per 100 contracts in and out). Not financial advice.
+- **Legality.** Kalshi and Polymarket US are both CFTC-regulated US exchanges. Check both
+  venues' terms for automated trading.
+- **No guarantee.** Arbs are rare and short-lived, and a failed hedge costs fees.
+  Not financial advice.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests
+python -m unittest discover -s tests
 ```
 
-There are 34 offline tests. They cover:
+There are 49 offline tests. They cover:
 
-- **Math:** fee formulas, coverage and tie logic, middles, depth sizing.
-- **Execution:** leg order, the leg-1 price cap, hedged/missed/unwound/held
-  outcomes, settlement.
+- **Math:** fee formulas (both venues' docs tables), coverage and tie logic, middles, depth sizing.
+- **Execution:** leg order (stale venue first in-play), the leg-1 price cap,
+  hedged/missed/unwound/held outcomes, settlement.
 - **Safety:** kill switch, halt after failed hedges, spend tracking.
 - **Kalshi orders:** request signing, and YES/NO → bid/ask mapping including
   reduce-only sells.
-- **Polymarket orders:** delayed-match polling, cancelling an unmatched order, rejections.
+- **Polymarket US:** market parsing (moneyline/spread → score axis), long/short book
+  mirroring, suspended markets, settlement, signing, BUY/SELL LONG/SHORT with YES-price
+  conversion, partial fills, rejections, cancelling an order left open.

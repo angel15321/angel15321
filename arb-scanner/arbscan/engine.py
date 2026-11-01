@@ -177,9 +177,7 @@ def find(games: list[Game], min_roi: float = 0.0, cross_venue_only: bool = False
                     if cross_venue_only and a.venue == b.venue:
                         continue
                     if a.ref.get("ticker") and a.ref.get("ticker") == b.ref.get("ticker"):
-                        continue               # YES+NO of one Kalshi market
-                    if a.ref.get("token0") and a.ref.get("token0") == b.ref.get("token0"):
-                        continue               # both outcomes of one Polymarket market
+                        continue               # YES+NO (long+short) of one market
                     unit = a.unit_cost + b.unit_cost
                     if unit >= 1 + near:
                         continue

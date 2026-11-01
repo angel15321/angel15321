@@ -4,10 +4,12 @@ Execution of one arb
 --------------------
 1. Size it against live depth, capped by --max-per-trade and the cash on
    each venue (and the daily / open-exposure limits).
-2. Leg 1 = the Polymarket leg when there is one (its sports markets match
-   after a short delay, so we must see that fill before hedging); otherwise
-   the thinner leg. Leg 1 is an immediate-or-cancel buy whose limit keeps the
-   pair profitable against leg 2's current price.
+2. Leg 1 = the leg most likely to vanish. In a game in progress that is the
+   STALE venue: after a score one venue reprices first and the other's old
+   quotes get pulled, so the leg whose price moved least since the last scan
+   goes first (--leg1 auto). Otherwise the Polymarket leg goes first, and for
+   a same-venue pair the thinner leg. Leg 1 is an immediate-or-cancel buy
+   whose limit keeps the pair profitable against leg 2's current price.
 3. Leg 2 is bought for exactly what leg 1 filled, as immediate-or-cancel with
    a limit at the break-even price for the cost already paid. Retried
    --hedge-attempts times while the remainder is still hedgeable.
@@ -73,6 +75,8 @@ class Config:
     unwind_slippage: float = 0.03     # accept up to 3c below best bid when unwinding
     cooldown_min: float = 10.0
     include_live_games: bool = False  # in-play arbs move fastest; off by default
+    in_play_only: bool = False        # only games already in progress (implies include_live_games)
+    leg1: str = "auto"                # auto (stale venue first in-play) | polymarket | kalshi
     cross_venue_only: bool = False
     max_failures: int = 2             # halt after this many unhedged/unwound trades in a row
     kill_file: str = "STOP"
@@ -114,6 +118,28 @@ def recent_failures(db, mode: str, n: int) -> int:
     return streak
 
 
+def mid(c: Contract) -> float | None:
+    if c.book.best_bid is None or c.book.best_ask is None:
+        return None
+    return (c.book.best_bid + c.book.best_ask) / 2
+
+
+def first_leg(opp: engine.Opportunity, cfg: Config, moves: dict[str, float] | None = None) -> str:
+    """'a' or 'b': which leg to buy first (see module docstring)."""
+    a, b = opp.a, opp.b
+    if a.venue == b.venue:
+        top = {k: c.book.asks[0][1] if c.book.asks else 0 for k, c in (("a", a), ("b", b))}
+        return "a" if top["a"] <= top["b"] else "b"
+    if cfg.leg1 in ("polymarket", "kalshi"):
+        want = "Polymarket" if cfg.leg1 == "polymarket" else "Kalshi"
+        return "a" if a.venue == want else "b"
+    live = opp.game.start is not None and opp.game.start <= dt.datetime.now(dt.timezone.utc)
+    ma, mb = (moves or {}).get(a.id), (moves or {}).get(b.id)
+    if live and ma is not None and mb is not None and abs(ma - mb) >= 0.005:
+        return "a" if ma < mb else "b"
+    return "a" if a.venue == "Polymarket" else "b"
+
+
 def recently_taken(db, key: str, minutes: float) -> bool:
     return db.execute("SELECT 1 FROM trades WHERE opp_key=? AND detected_at>? LIMIT 1",
                       (key, time.time() - minutes * 60)).fetchone() is not None
@@ -121,7 +147,8 @@ def recently_taken(db, key: str, minutes: float) -> bool:
 
 # ---------------------------------------------------------------- execution
 
-def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: float, log=print) -> dict:
+def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: float, log=print,
+            moves: dict[str, float] | None = None) -> dict:
     mode = "live" if cfg.live else "dry"
     detected = time.time()
     plan = engine.size(opp.a, opp.b, opp.guaranteed, max_outlay=budget)
@@ -129,11 +156,7 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
         return {}
 
     legs = {"a": (opp.a, plan.fills_a), "b": (opp.b, plan.fills_b)}
-    if opp.a.venue != opp.b.venue:
-        first = "a" if opp.a.venue == "Polymarket" else "b"
-    else:
-        top = {k: c.book.asks[0][1] if c.book.asks else 0 for k, (c, _) in legs.items()}
-        first = "a" if top["a"] <= top["b"] else "b"
+    first = first_leg(opp, cfg, moves)
     second = "b" if first == "a" else "a"
     c1, plan1 = legs[first]
     c2, plan2 = legs[second]
@@ -307,11 +330,36 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
         time.sleep(max(1.0, interval - (time.time() - t0)))
 
 
+_last_mid: dict[str, float] = {}   # contract id -> mid at the previous scan
+
+
+def _moves(games) -> dict[str, float]:
+    """|mid now - mid last scan| per contract; remembers this scan's mids."""
+    out = {}
+    for g in games:
+        for c in g.contracts:
+            m = mid(c)
+            if m is None:
+                continue
+            if c.id in _last_mid:
+                out[c.id] = abs(m - _last_mid[c.id])
+            _last_mid[c.id] = m
+    return out
+
+
 def _tick(db, cfg: Config, brokers: dict, days: float, log):
     mode = "live" if cfg.live else "dry"
-    snap = scanner.snapshot(days)
+    # Polymarket US is one book request per market, so in-play scans only fetch
+    # games starting within 30 min (Kalshi kickoffs are estimates; filtered exactly below).
+    snap = scanner.snapshot(min(days, 0.02) if cfg.in_play_only else days)
     now = dt.datetime.now(dt.timezone.utc)
-    games = snap.games if cfg.include_live_games else [g for g in snap.games if g.start and g.start > now]
+    moves = _moves(snap.games)
+    if cfg.in_play_only:
+        games = [g for g in snap.games if g.start and now - dt.timedelta(hours=5) < g.start <= now]
+    elif cfg.include_live_games:
+        games = snap.games
+    else:
+        games = [g for g in snap.games if g.start and g.start > now]
     arbs, _ = engine.find(games, min_roi=cfg.min_roi, cross_venue_only=cfg.cross_venue_only)
     arbs = [o for o in engine.non_overlapping(arbs) if o.max.profit >= cfg.min_profit]
     log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
@@ -335,7 +383,7 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
             log(f"  skip {o.game.title}: limit reached (day ${room_day:.0f}, open ${room_open:.0f}, cash ${cash_cap:.0f})")
             continue
         try:
-            execute(db, o, brokers, cfg, budget, log)
+            execute(db, o, brokers, cfg, budget, log, moves=moves)
         except Exception as e:
             log(f"! execution error on {o.game.title}: {type(e).__name__}: {e}")
         if recent_failures(db, mode, cfg.max_failures) >= cfg.max_failures:

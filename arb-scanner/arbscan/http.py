@@ -9,7 +9,9 @@ import urllib.parse
 import urllib.request
 
 USER_AGENT = "nfl-arbscan/2.0 (personal research)"
-_MIN_INTERVAL = {"api.elections.kalshi.com": 0.08}  # Kalshi basic tier: ~20 reads/s
+# Kalshi basic tier: ~20 reads/s. Polymarket US: 25 req/s per IP, shared with
+# order traffic, so public reads keep to ~16/s and leave room for orders.
+_MIN_INTERVAL = {"api.elections.kalshi.com": 0.08, "gateway.polymarket.us": 0.06}
 _last: dict[str, float] = {}
 _lock = threading.Lock()
 
