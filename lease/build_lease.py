@@ -109,11 +109,11 @@ class Doc:
             c.setLineWidth(0.5)
             if multiline:
                 c.rect(x, y, w, h, stroke=1, fill=0)
-                ly = y + h - 16
+                ly = y + h - 18
                 c.setStrokeColor(HexColor("#999999"))
                 while ly > y + 4:
                     c.line(x + 4, ly, x + w - 4, ly)
-                    ly -= 16
+                    ly -= 18
             else:
                 c.line(x, y + 1, x + w, y + 1)
             c.restoreState()
@@ -207,7 +207,7 @@ class Doc:
         return names
 
     def multiline(self, base, lines=3, after=6):
-        h = lines * 12 + 4
+        h = lines * 18 + 6
         self.ensure(h)
         self.text_field(self.name(base), LM, self.y - h, TEXT_W, h, multiline=True)
         self.y -= h + after
@@ -491,10 +491,23 @@ def lease(d: Doc):
            "entry or use it to harass Tenant. Routine inspections are described in Section 25.")
 
     # 17 alterations
-    d.section("17. Alterations")
-    d.para("Tenant may not paint, wallpaper, install fixtures, satellite equipment, or make any "
-           "alterations or improvements without Landlord’s prior written consent. Tenant will pay "
-           "to restore the Premises from any unapproved change.")
+    d.section("17. No Alterations \u2014 Recently Renovated Home")
+    d.para("The Premises were recently renovated. To protect that work, Tenant, occupants, and guests "
+           "may <b>not</b> make any alteration, addition, or improvement without Landlord\u2019s "
+           "<b>prior written consent</b>, including:")
+    d.para("\u2022 painting, staining, or wallpapering any wall, ceiling, cabinet, door, or trim; "
+           "\u2022 changing, removing, or installing flooring, carpet, tile, or countertops; "
+           "\u2022 replacing or adding light fixtures, ceiling fans, faucets, appliances, or window "
+           "coverings; \u2022 mounting TVs, shelves, or brackets, or drilling into walls, cabinets, or "
+           "tile; \u2022 changing or adding locks, doorbells, cameras, or security systems; "
+           "\u2022 installing satellite dishes or antennas (except as federal law allows); and "
+           "\u2022 removing or planting trees, shrubs, or landscaping.", BULLET)
+    d.para("Small nails for hanging pictures are allowed; Tenant must fill the holes at move-out. "
+           "Tenant may not hire contractors to work on the Premises. Any approved change becomes part "
+           "of the Premises unless Landlord says otherwise in writing. Tenant will pay the full cost "
+           "to repair damage from, and restore the Premises after, any unapproved change, and an "
+           "unapproved alteration is a material noncompliance with this Lease.")
+    d.initials_line()
 
     # 18 insurance
     d.section("18. Insurance")
@@ -612,8 +625,13 @@ def lease(d: Doc):
     ]
     for i, r in enumerate(rules, 1):
         d.para(f"{i}.&nbsp; " + r, BULLET, after=3)
-    d.para("Other terms agreed for this property:", after=3)
-    d.multiline("addl_terms", lines=4)
+    d.para("<b>Special conditions for this Tenant / property.</b> Write any conditions that apply "
+           "only to this tenancy (for example: a co-signer, a payment plan, approved pets or "
+           "vehicles, items the Landlord will repair before move-in, or items left in the home). "
+           "If more room is needed, attach a signed addendum and list it in Section 26. "
+           "Write \u201cNONE\u201d if there are no special conditions.", after=4)
+    d.multiline("addl_terms", lines=8)
+    d.initials_line("Tenant initials (special conditions):")
 
     # 26 acknowledgment & signatures
     d.section("26. Acknowledgments and Signatures")
@@ -625,6 +643,7 @@ def lease(d: Doc):
     d.row([("Attachments:", None, None), ("[]", "att", "A – Bed Bug Information"),
            ("[]", "att", "B – Move-In/Move-Out Form"), ("[]", "att", "Lead Paint Disclosure"),
            ("[]", "att", "HOA Rules")])
+    d.row([("[]", "att", "Special conditions addendum"), ("[]", "att", "Co-signer / guarantor agreement")])
     d.row([("[]", "att", "Other:"), ("", "att_other", None)])
     d.space(4)
     for i in range(1, 5):
@@ -807,7 +826,8 @@ def build_checklist(path, printable=False):
                 "If pool/spa: Arizona private pool safety notice given.",
                 "If HOA: copy of HOA rules given.",
                 "Renter’s insurance minimum filled in (Section 18; $100,000 liability suggested).",
-                "Any special terms written in Section 25 — specific and measurable, not vague.",
+                "Special conditions for this tenant written in Section 25 (or \u201cNONE\u201d) and initialed; any extra addendum listed in Section 26.",
+                "Tenant told the home was renovated: no painting or alterations without written consent (Section 17).",
             ]),
             ("At signing", [
                 "Every adult tenant initials every page and signs Section 26.",
