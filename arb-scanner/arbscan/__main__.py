@@ -14,7 +14,7 @@ import datetime as dt
 import json
 import sys
 
-from . import engine, fees, report, scanner, trader
+from . import engine, fees, pmws, polymarket, report, scanner, trader
 
 
 def _log_to(path: str | None):
@@ -26,6 +26,18 @@ def _log_to(path: str | None):
             fh.write(f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}\n")
             fh.flush()
     return log
+
+
+def _attach_feed(log=print) -> bool:
+    """Use live Polymarket US books from the websocket when the API key is in the environment."""
+    feed = pmws.BookFeed.from_env()
+    if feed is None:
+        log("Polymarket books: REST snapshots (cached, can lag 10-30 s). Set POLYMARKET_KEY_ID / "
+            "POLYMARKET_SECRET_KEY for live websocket books.")
+        return False
+    polymarket.use_feed(feed)
+    log("Polymarket books: live websocket")
+    return True
 
 
 def cmd_run(a):
@@ -52,6 +64,9 @@ def cmd_run(a):
         f"min ROI {cfg.min_roi * 100:.2f}% · min profit ${cfg.min_profit:.2f} · on failed hedge: {cfg.on_fail} · "
         f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
         f" · leg 1: {cfg.leg1}")
+    if not _attach_feed(log) and cfg.live:
+        sys.exit("Live trading needs the Polymarket US websocket (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY): "
+                 "the REST books lag the exchange by 10-30 s.")
     log(f"Stop: Ctrl-C, or create a file named '{cfg.kill_file}' here. Ledger: {a.db}")
     try:
         trader.run(db, cfg, brokers, a.days, a.interval, once=a.once, log=log)
@@ -91,12 +106,14 @@ def cmd_status(a):
 
 
 def cmd_scan(a):
+    _attach_feed()
     snap = scanner.snapshot(a.days)
     arbs, closest = engine.find(snap.games, a.min_roi, a.cross_venue_only, near=0.03)
     print(report.text(snap, engine.non_overlapping(arbs), closest))
 
 
 def cmd_liquidity(a):
+    _attach_feed()
     snap = scanner.snapshot(a.days)
     print(f"{'GAME':<10} {'VENUE':<10} {'MARKET':<9} {'MAIN LINE':<11} {'BID/ASK':>13} {'SPRD':>5} "
           f"{'DEPTH≤2¢':>11} {'LINES':>5} {'24H VOL':>9}")

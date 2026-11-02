@@ -1,6 +1,9 @@
 """Polymarket US adapter: NFL moneyline and full-game spread markets + order books.
 
-Everything here is the PUBLIC gateway (gateway.polymarket.us); no key needed.
+Market lists come from the PUBLIC gateway (gateway.polymarket.us). Order books
+come from the live markets websocket (pmws.BookFeed, needs the API key) when one
+is attached with use_feed(); otherwise from the REST book endpoint, which is a
+cached snapshot that can lag the exchange by 10-30 s.
 
 Polymarket US lists ONE instrument per market (the YES / "long" side). Buying
 NO is a short of that instrument, so each market yields two contracts here:
@@ -68,10 +71,18 @@ def _event_markets(slug: str) -> list[dict]:
     return ms
 
 
-def fetch_book(slug: str) -> tuple[Book, Book]:
-    """(long book, short book). A market that is not open for trading gets empty books."""
-    md = http.get(f"{GATEWAY}/v1/markets/{slug}/book").get("marketData") or {}
-    now = time.time()
+_feed = None             # pmws.BookFeed when live books are available (see use_feed)
+
+
+def use_feed(feed) -> None:
+    """Read books from a live websocket feed instead of the (cached, lagging) REST endpoints."""
+    global _feed
+    _feed = feed
+
+
+def books_from(md: dict, now: float | None = None) -> tuple[Book, Book]:
+    """marketData -> (long book, short book). A market not open for trading gets empty books."""
+    now = time.time() if now is None else now
     if md.get("state") not in (None, "MARKET_STATE_OPEN"):
         return Book(fetched_at=now), Book(fetched_at=now)
     offers = sorted(_levels(md.get("offers")))
@@ -82,6 +93,11 @@ def fetch_book(slug: str) -> tuple[Book, Book]:
     return long, short
 
 
+def fetch_book(slug: str) -> tuple[Book, Book]:
+    """REST snapshot. Cached server-side and up to ~30 s old: fine for a scan, not for trading in-play."""
+    return books_from(http.get(f"{GATEWAY}/v1/markets/{slug}/book").get("marketData") or {})
+
+
 def _safe_book(slug: str):
     try:
         return fetch_book(slug)
@@ -90,6 +106,18 @@ def _safe_book(slug: str):
 
 
 def fetch_books(slugs: list[str]) -> dict[str, tuple[Book, Book]]:
+    if _feed is not None:
+        # Live feed only: a market it has no book for yet is left out (no trade) rather
+        # than priced from a stale REST snapshot.
+        new = _feed.want(slugs)
+        if new:
+            _feed.wait_for(new, timeout=2.0)          # first books for newly subscribed markets
+        out = {}
+        for slug in slugs:
+            md = _feed.get(slug)
+            if md is not None:
+                out[slug] = books_from(md)
+        return out
     out = {}
     with cf.ThreadPoolExecutor(max_workers=8) as ex:
         for slug, books in zip(slugs, ex.map(_safe_book, slugs)):

@@ -21,8 +21,11 @@ python -m arbscan run
 ## How a trade happens
 
 1. **Scan** (every 15 s, or `--interval`). It pulls every NFL moneyline and full-game
-   spread on both venues with full order books. Polymarket US is one book request per
-   market, so a 1-day scan takes ~12 s; in-play-only scans only the games in progress.
+   spread on both venues with full order books. **Polymarket US books stream over its
+   markets websocket** (fresh every ~0.1–0.2 s) whenever `POLYMARKET_KEY_ID` /
+   `POLYMARKET_SECRET_KEY` are set; an in-play scan then takes ~1 s. Without the key it
+   falls back to the REST book endpoint, which is a cached snapshot that can lag the
+   exchange by 10–30 s: fine for a look, useless for trading in-play (live mode refuses it).
 2. **Find.** It pairs any two contracts that together pay at least $1 on every possible
    score (same line on two venues, middles like KC -2.5 + DEN +3.5, moneyline vs
    spread). A pair counts only if it still profits after both venues' taker fees.
@@ -146,8 +149,12 @@ a 90¢/10¢ pair needs ~1.3¢.
   sends 1 − your NO limit. It costs the same buying power as buying NO.
 - **What's covered.** Polymarket US lists NFL moneylines and spreads (full game, halves,
   quarters) but no totals. Only moneylines and full-game spreads have a Kalshi match.
-- **Rate limit.** Polymarket US allows 25 requests/s per IP, shared by data and orders; the
-  bot keeps its public reads to ~16/s.
+- **Rate limits.** Polymarket US allows 25 requests/s per IP, shared by data and orders; with
+  the websocket the bot makes almost no REST reads. Kalshi rate-limits balance reads per
+  account (shared with any other bot on it), so balances are read at most every 20 s and
+  re-read after each trade; a rate-limited hedge waits 1 s before its retry.
+- **Why the websocket matters.** On 2026-11-01 the first live run priced Polymarket from REST
+  books: 4 orders, 4 expired unfilled, because the quotes were already gone.
 - **Cash sits on both venues** until settlement. Keep both accounts funded; the
   smaller balance limits each arb's size.
 - **Legality.** Kalshi and Polymarket US are both CFTC-regulated US exchanges. Check both
@@ -161,7 +168,7 @@ a 90¢/10¢ pair needs ~1.3¢.
 python -m unittest discover -s tests
 ```
 
-There are 49 offline tests. They cover:
+There are 53 offline tests. They cover:
 
 - **Math:** fee formulas (both venues' docs tables), coverage and tie logic, middles, depth sizing.
 - **Execution:** leg order (stale venue first in-play), the leg-1 price cap,
@@ -171,4 +178,4 @@ There are 49 offline tests. They cover:
   reduce-only sells.
 - **Polymarket US:** market parsing (moneyline/spread → score axis), long/short book
   mirroring, suspended markets, settlement, signing, BUY/SELL LONG/SHORT with YES-price
-  conversion, partial fills, rejections, cancelling an order left open.
+  conversion, partial fills, rejections, cancelling an order left open; books served only from the live feed (never a stale REST one), feed staleness, the balance cache.

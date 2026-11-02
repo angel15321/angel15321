@@ -162,6 +162,30 @@ class SafetyTests(Base):
         self.assertEqual(trader.spent_today(self.db, "live"), 0)
 
 
+class BalanceCacheTests(unittest.TestCase):
+    def setUp(self):
+        trader._cash.update(at=0.0, values=None)
+        self.k, self.p = mock.Mock(), mock.Mock()
+        self.k.balance.return_value, self.p.balance.return_value = 25.0, 24.0
+        self.b = {"Kalshi": self.k, "Polymarket": self.p}
+
+    def test_reads_once_within_ttl(self):
+        self.assertEqual(trader.balances(self.b), {"Kalshi": 25.0, "Polymarket": 24.0})
+        trader.balances(self.b)
+        self.assertEqual(self.k.balance.call_count, 1)
+        trader.balances(self.b, force=True)
+        self.assertEqual(self.k.balance.call_count, 2)
+
+    def test_rate_limited_read_falls_back_to_recent_value(self):
+        trader.balances(self.b)
+        trader._cash["at"] -= trader.CASH_TTL + 1
+        self.k.balance.side_effect = RuntimeError("HTTP 429")
+        self.assertEqual(trader.balances(self.b)["Kalshi"], 25.0)
+        trader._cash["at"] -= trader.CASH_STALE_OK
+        with self.assertRaises(RuntimeError):
+            trader.balances(self.b)
+
+
 class KalshiBrokerTests(unittest.TestCase):
     def setUp(self):
         from cryptography.hazmat.primitives import serialization

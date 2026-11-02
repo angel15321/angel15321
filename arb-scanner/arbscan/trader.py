@@ -30,7 +30,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from . import engine, scanner
+from . import engine, polymarket, scanner
 from .brokers import Fill, floor_to, max_price_within
 from .model import Contract
 
@@ -194,7 +194,8 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
         if remaining <= 0:
             break
         if attempt + 1 < cfg.hedge_attempts:
-            time.sleep(0.3)
+            # a rate-limited hedge needs a real pause before the retry, or it 429s again
+            time.sleep(1.0 if "429" in (f2.error or "") else 0.3)
 
     residual = q1 - hedged
     qty1_held = q1
@@ -347,10 +348,30 @@ def _moves(games) -> dict[str, float]:
     return out
 
 
+_cash: dict = {"at": 0.0, "values": None}
+CASH_TTL = 20.0        # s: Kalshi rate-limits balance reads per account, shared with any other bot on it
+CASH_STALE_OK = 120.0  # s: on a failed read, an older balance still caps the size
+
+
+def balances(brokers: dict, force: bool = False) -> dict[str, float]:
+    """Venue cash, read at most every CASH_TTL seconds (re-read after every trade)."""
+    now = time.time()
+    if not force and _cash["values"] is not None and now - _cash["at"] < CASH_TTL:
+        return _cash["values"]
+    try:
+        vals = {v: b.balance() for v, b in brokers.items()}
+    except Exception:
+        if _cash["values"] is not None and now - _cash["at"] < CASH_STALE_OK:
+            return _cash["values"]
+        raise
+    _cash.update(at=now, values=vals)
+    return vals
+
+
 def _tick(db, cfg: Config, brokers: dict, days: float, log):
     mode = "live" if cfg.live else "dry"
-    # Polymarket US is one book request per market, so in-play scans only fetch
-    # games starting within 30 min (Kalshi kickoffs are estimates; filtered exactly below).
+    # In-play scans only fetch games starting within 30 min (Kalshi kickoffs are
+    # estimates, so the exact in-progress filter is applied below).
     snap = scanner.snapshot(min(days, 0.02) if cfg.in_play_only else days)
     now = dt.datetime.now(dt.timezone.utc)
     moves = _moves(snap.games)
@@ -362,16 +383,18 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
         games = [g for g in snap.games if g.start and g.start > now]
     arbs, _ = engine.find(games, min_roi=cfg.min_roi, cross_venue_only=cfg.cross_venue_only)
     arbs = [o for o in engine.non_overlapping(arbs) if o.max.profit >= cfg.min_profit]
+    feed = polymarket._feed
+    feed_note = " · Polymarket feed DOWN" if feed is not None and not feed.alive() else ""
     log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
         f"{sum(len(g.contracts) for g in games):,} contracts · {len(arbs)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
-        + (" · " + "; ".join(snap.errors) if snap.errors else ""))
+        + feed_note + (" · " + "; ".join(snap.errors) if snap.errors else ""))
     for o in arbs:
         if recently_taken(db, o.key, cfg.cooldown_min):
             continue
         room_day = cfg.max_daily_spend - spent_today(db, mode)
         room_open = cfg.max_open - open_exposure(db, mode)
         try:
-            cash = {v: b.balance() for v, b in brokers.items()}
+            cash = balances(brokers)
         except Exception as e:
             log(f"! balance check failed: {e}")
             return
@@ -383,8 +406,11 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
             log(f"  skip {o.game.title}: limit reached (day ${room_day:.0f}, open ${room_open:.0f}, cash ${cash_cap:.0f})")
             continue
         try:
-            execute(db, o, brokers, cfg, budget, log, moves=moves)
+            done = execute(db, o, brokers, cfg, budget, log, moves=moves)
         except Exception as e:
+            done = True
             log(f"! execution error on {o.game.title}: {type(e).__name__}: {e}")
+        if done:
+            _cash["at"] = 0.0          # cash changed (or may have): re-read before the next trade
         if recent_failures(db, mode, cfg.max_failures) >= cfg.max_failures:
             return

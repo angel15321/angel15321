@@ -181,6 +181,49 @@ class PolymarketUSParseTests(unittest.TestCase):
         with mock.patch("arbscan.http.get", return_value=book):
             self.assertEqual(polymarket.fetch_book("s")[0].asks, [])
 
+    def test_books_come_from_live_feed_never_rest(self):
+        md = {"state": "MARKET_STATE_OPEN", "bids": [{"px": {"value": "0.40"}, "qty": "100"}],
+              "offers": [{"px": {"value": "0.42"}, "qty": "50"}]}
+
+        class FakeFeed:
+            def __init__(self):
+                self.asked = []
+
+            def want(self, slugs):
+                self.asked.append(list(slugs))
+                return set()
+
+            def wait_for(self, slugs, timeout=2.0):
+                pass
+
+            def get(self, slug):
+                return md if slug == "live" else None
+        feed = FakeFeed()
+        polymarket.use_feed(feed)
+        try:
+            with mock.patch("arbscan.http.get", side_effect=AssertionError("REST must not be used")):
+                out = polymarket.fetch_books(["live", "nobook"])
+        finally:
+            polymarket.use_feed(None)
+        self.assertEqual(feed.asked, [["live", "nobook"]])
+        self.assertEqual(out["live"][0].asks, [(0.42, 50.0)])
+        self.assertNotIn("nobook", out)          # no live book -> no price, never a stale REST one
+
+    def test_feed_stores_latest_book_and_goes_stale(self):
+        from arbscan import pmws
+        f = pmws.BookFeed.__new__(pmws.BookFeed)
+        f.books, f.connected, f.last_msg, f.error = {}, True, 0.0, ""
+        f._handle('{"marketData": {"marketSlug": "s", "bids": [], "offers": []}}')
+        f._handle('{"heartbeat": {}}')
+        f._handle('{"requestId": "x", "error": "bad slug"}')
+        self.assertIn("s", f.books)
+        self.assertEqual(f.error, "bad slug")
+        import time as _t
+        f.last_msg = _t.time()
+        self.assertIsNotNone(f.get("s"))
+        f.last_msg = _t.time() - 60               # silent connection: books are not trusted
+        self.assertIsNone(f.get("s"))
+
     def test_settlement_sides(self):
         with mock.patch("arbscan.http.get", return_value={"slug": "s", "settlement": 1}):
             self.assertEqual(polymarket.settlement("s", "long"), 1.0)

@@ -1,0 +1,138 @@
+"""Live Polymarket US order books over the markets websocket.
+
+The REST book endpoints (gateway and api) serve cached snapshots that can lag
+the exchange by 10-30 s, with flickering sizes at the top of book; trading off
+them in-play means chasing quotes that are already gone. The websocket
+(wss://api.polymarket.us/v1/ws/markets, SUBSCRIPTION_TYPE_MARKET_DATA) pushes
+the full book for each subscribed market every ~0.1-0.2 s, so this feed keeps
+the latest one per market in memory and the scanner reads from it.
+
+It runs an asyncio loop on a daemon thread, signs the handshake with the same
+Ed25519 key as REST orders, subscribes in chunks of 100 markets (the server's
+limit), and reconnects with backoff, re-subscribing everything it was asked for.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import threading
+import time
+
+URL = "wss://api.polymarket.us/v1/ws/markets"
+PATH = "/v1/ws/markets"
+CHUNK = 100              # markets per subscription (server limit)
+DEAD_AFTER = 5.0         # seconds without any message -> connection presumed dead
+
+
+class BookFeed:
+    def __init__(self, key_id: str, secret_key_b64: str, url: str = URL):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        self.key_id = key_id
+        self.key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(secret_key_b64)[:32])
+        self.url = url
+        self.books: dict[str, tuple[float, dict]] = {}   # slug -> (received at, marketData)
+        self.wanted: set[str] = set()
+        self._sent: set[str] = set()                      # slugs subscribed on the current connection
+        self._lock = threading.Lock()
+        self.connected = False
+        self.last_msg = 0.0
+        self.reconnects = 0
+        self.error = ""
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ws = None
+        self._thread = threading.Thread(target=self._run, name="pm-books", daemon=True)
+        self._thread.start()
+
+    @classmethod
+    def from_env(cls) -> "BookFeed | None":
+        kid, sec = os.environ.get("POLYMARKET_KEY_ID"), os.environ.get("POLYMARKET_SECRET_KEY")
+        return cls(kid, sec) if kid and sec else None
+
+    # ------------------------------------------------------------ public
+
+    def want(self, slugs) -> set[str]:
+        """Make sure these markets are subscribed; returns the ones that were not yet."""
+        new = set(slugs) - self.wanted
+        if not new:
+            return new
+        with self._lock:
+            self.wanted |= new
+        if self._loop and self.connected:
+            asyncio.run_coroutine_threadsafe(self._subscribe_missing(), self._loop)
+        return new
+
+    def alive(self) -> bool:
+        return self.connected and time.time() - self.last_msg < DEAD_AFTER
+
+    def get(self, slug: str) -> dict | None:
+        """Latest marketData for `slug`, or None if the feed has none or is not alive."""
+        hit = self.books.get(slug)
+        if hit is None or not self.alive():
+            return None
+        return hit[1]
+
+    def wait_for(self, slugs, timeout: float = 2.0) -> None:
+        """Block briefly until every slug has a first book (or timeout)."""
+        end = time.time() + timeout
+        while time.time() < end and any(s not in self.books for s in slugs):
+            time.sleep(0.05)
+
+    # ------------------------------------------------------------ internals
+
+    def _headers(self) -> dict:
+        ts = str(int(time.time() * 1000))
+        sig = self.key.sign(f"{ts}GET{PATH}".encode())
+        return {"X-PM-Access-Key": self.key_id, "X-PM-Timestamp": ts,
+                "X-PM-Signature": base64.b64encode(sig).decode()}
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._loop.run_until_complete(self._forever())
+
+    async def _forever(self) -> None:
+        import websockets
+        backoff = 1.0
+        while True:
+            try:
+                async with websockets.connect(self.url, additional_headers=self._headers(), open_timeout=15,
+                                              max_size=2 ** 23, ping_interval=20) as ws:
+                    self._ws, self.connected, self._sent = ws, True, set()
+                    self.last_msg = time.time()
+                    backoff = 1.0
+                    await self._subscribe_missing()
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=DEAD_AFTER * 3)
+                        self.last_msg = time.time()
+                        self._handle(raw)
+            except Exception as e:  # reconnect on anything: network, auth hiccup, server close
+                self.error = f"{type(e).__name__}: {e}"[:200]
+            self.connected, self._ws = False, None
+            self.reconnects += 1
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+    async def _subscribe_missing(self) -> None:
+        ws = self._ws
+        if ws is None:
+            return
+        with self._lock:
+            todo = sorted(self.wanted - self._sent)
+            self._sent |= set(todo)
+        for i in range(0, len(todo), CHUNK):
+            chunk = todo[i:i + CHUNK]
+            await ws.send(json.dumps({"subscribe": {
+                "requestId": f"md-{int(time.time() * 1000)}-{i}", "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+                "marketSlugs": chunk}}))
+
+    def _handle(self, raw) -> None:
+        try:
+            m = json.loads(raw)
+        except ValueError:
+            return
+        md = m.get("marketData")
+        if md and md.get("marketSlug"):
+            self.books[md["marketSlug"]] = (time.time(), md)
+        elif m.get("error"):
+            self.error = str(m["error"])[:200]
