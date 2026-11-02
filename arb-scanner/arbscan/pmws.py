@@ -73,6 +73,11 @@ class BookFeed:
             return None
         return hit[1]
 
+    def get_at(self, slug: str) -> tuple[float, dict] | None:
+        """(received at, marketData) for `slug`, or None if the feed has none or is not alive."""
+        hit = self.books.get(slug)
+        return hit if hit is not None and self.alive() else None
+
     def wait_for(self, slugs, timeout: float = 2.0) -> None:
         """Block briefly until every slug has a first book (or timeout)."""
         end = time.time() + timeout

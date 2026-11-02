@@ -306,14 +306,15 @@ class PolymarketBroker:
             if rejected:
                 err = f"{rejected.get('orderRejectReason', '')} {rejected.get('text', '')}".strip()
             return Fill(self.venue, action, c.label, order_id=oid, status="rejected" if rejected else "no fill",
-                        error=err, raw={"state": state, "request_price": body["price"]["value"]})
+                        error=err, raw={"state": state, "request_price": body["price"]["value"],
+                                                 "create_time": order.get("createTime")})
         holds_long = c.ref["side"] == "long"
         avg = avg_yes if holds_long else 1 - avg_yes
         fee_v = (order.get("commissionNotionalTotalCollected") or {}).get("value")
         fee = float(fee_v) if fee_v not in (None, "") else c.fee.fill_fee(avg, filled)
         return Fill(self.venue, action, c.label, filled, avg, fee, oid, "filled",
                     raw={"state": state, "avg_yes": avg_yes, "request_price": body["price"]["value"],
-                         "intent": body["intent"]})
+                         "intent": body["intent"], "create_time": order.get("createTime")})
 
     def _final(self, oid: str, c: Contract, wait: float = 3.0) -> dict | None:
         """Poll an order that came back without a final state; cancel anything left open."""

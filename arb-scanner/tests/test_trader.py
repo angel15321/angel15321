@@ -79,6 +79,59 @@ class ExecuteTests(Base):
         self.assertEqual(row["status"], "closed")
         self.assertAlmostEqual(row["cash_out"], 0)
 
+    def test_live_miss_records_probe(self):
+        o = opp([(0.45, 100)], [(0.50, 100)])
+        for x in (o.a, o.b):
+            x.book.fetched_at = 1000.0
+
+        class NoFill:
+            def buy(self, c, qty, limit, notional_hint=0):
+                return brokers.Fill(c.venue, "buy", c.label, order_id="X", status="no fill",
+                                    raw={"state": "ORDER_STATE_EXPIRED", "create_time": "2026-11-02T04:04:41Z"})
+        cfg = trader.Config(min_profit=0.01, min_roi=0.0, live=True)
+        after = {"asks": [[0.55, 10]], "age": 0.1}
+        logs = []
+        with mock.patch("arbscan.trader.book_now", return_value=after) as now,                 mock.patch("arbscan.trader.time.time", side_effect=[1000.5, 1000.6, 1000.9, 1001.0, 1001.0]):
+            row = trader.execute(self.db, o, {"Kalshi": NoFill(), "Polymarket": NoFill()}, cfg,
+                                 budget=1000, log=logs.append)
+        self.assertEqual(row["outcome"], "missed")
+        now.assert_called_once()
+        p = json.loads(self.db.execute("SELECT probe FROM trades WHERE id=?", (row["id"],)).fetchone()[0])
+        self.assertEqual(p["leg1"], "Polymarket")
+        self.assertEqual(p["book1"], [[0.50, 100]])
+        self.assertAlmostEqual(p["age1"], 0.5)
+        self.assertAlmostEqual(p["sent_ms"], 100.0)
+        self.assertAlmostEqual(p["back_ms"], 400.0)
+        self.assertEqual(p["exch_time"], "2026-11-02T04:04:41Z")
+        self.assertEqual(p["after1"], after)
+        self.assertIn("now 0.55", logs[-1])
+
+    def test_dry_miss_does_not_reread_book(self):
+        o = opp([(0.45, 100)], [(0.50, 100)])
+
+        def gone(cs):
+            for x in cs:
+                if x.venue == "Polymarket":
+                    x.book = Book(asks=[(0.80, 100)])
+        with mock.patch("arbscan.scanner.refresh", side_effect=gone),                 mock.patch("arbscan.trader.book_now") as now:
+            row = trader.execute(self.db, o, self.paper, self.cfg, budget=1000, **QUIET)
+        self.assertEqual(row["outcome"], "missed")
+        now.assert_not_called()
+
+    def test_old_ledger_gets_probe_column(self):
+        import sqlite3
+        path = self.tmp.name + ".old"
+        old = sqlite3.connect(path)
+        old.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, mode TEXT, detected_at REAL, opp_key TEXT)")
+        old.commit()
+        old.close()
+        try:
+            db = trader.connect(path)
+            self.assertIn("probe", {r[1] for r in db.execute("PRAGMA table_info(trades)")})
+            db.close()
+        finally:
+            os.unlink(path)
+
     def _leg2_moves(self, cfg):
         o = opp([(0.45, 100)], [(0.50, 100)], b_bids=[(0.49, 500)])
 

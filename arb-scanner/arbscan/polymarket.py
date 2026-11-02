@@ -114,9 +114,9 @@ def fetch_books(slugs: list[str]) -> dict[str, tuple[Book, Book]]:
             _feed.wait_for(new, timeout=2.0)          # first books for newly subscribed markets
         out = {}
         for slug in slugs:
-            md = _feed.get(slug)
-            if md is not None:
-                out[slug] = books_from(md)
+            hit = _feed.get_at(slug)
+            if hit is not None:
+                out[slug] = books_from(hit[1], now=hit[0])     # book age = time since the feed sent it
         return out
     out = {}
     with cf.ThreadPoolExecutor(max_workers=8) as ex:

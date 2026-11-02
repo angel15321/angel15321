@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS trades (
   cash_out REAL,                  -- net cash spent (fees included, unwind proceeds netted)
   locked_profit REAL,             -- for fully hedged trades
   status TEXT,                    -- open | settled | closed
-  payout REAL, pnl REAL, settled_at REAL, note TEXT
+  payout REAL, pnl REAL, settled_at REAL, note TEXT,
+  probe TEXT                      -- leg-1 timing + books seen / right after (JSON)
 );
 CREATE INDEX IF NOT EXISTS trades_key ON trades(opp_key, detected_at);
 """
@@ -57,6 +58,9 @@ def connect(path: str) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    if "probe" not in {r[1] for r in db.execute("PRAGMA table_info(trades)")}:
+        db.execute("ALTER TABLE trades ADD COLUMN probe TEXT")      # ledgers from before the probe
+        db.commit()
     return db
 
 
@@ -140,6 +144,37 @@ def first_leg(opp: engine.Opportunity, cfg: Config, moves: dict[str, float] | No
     return "a" if a.venue == "Polymarket" else "b"
 
 
+def _top(book, n: int = 3) -> list:
+    return [[p, s] for p, s in book.asks[:n]]
+
+
+def book_now(c: Contract) -> dict:
+    """Leg's ask book re-read from the source right now (feed for Polymarket, REST for Kalshi)."""
+    try:
+        if c.venue == "Polymarket":
+            books = polymarket.fetch_books([c.ref["slug"]]).get(c.ref["slug"])
+            book = books and books[0 if c.ref["side"] == "long" else 1]
+        else:
+            from . import kalshi
+            books = kalshi.fetch_books([c.ref["ticker"]]).get(c.ref["ticker"])
+            book = books and books[0 if c.ref["side"] == "yes" else 1]
+        if not book:
+            return {"asks": None}
+        return {"asks": _top(book), "age": round(time.time() - book.fetched_at, 3)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def probe_text(p: dict) -> str:
+    """One-line read of a leg-1 probe for the console."""
+    ask = (p.get("book1") or [[None]])[0][0]
+    s = f"saw {ask} ({p['age1']:.2f}s old), limit {p['limit1']:.3f}, sent +{p['sent_ms']:.0f}ms, back +{p['back_ms']:.0f}ms"
+    after = p.get("after1") or {}
+    if after.get("asks") is not None:
+        s += f"; now {after['asks'][0][0] if after['asks'] else 'empty'}"
+    return s
+
+
 def recently_taken(db, key: str, minutes: float) -> bool:
     return db.execute("SELECT 1 FROM trades WHERE opp_key=? AND detected_at>? LIMIT 1",
                       (key, time.time() - minutes * 60)).fetchone() is not None
@@ -171,11 +206,21 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
     log(f"  → {mode.upper()} {opp.game.title}: {c1.label} ({c1.venue}) then {c2.label} ({c2.venue}), "
         f"{plan.qty:g} pairs, plan +${plan.profit:.2f} ({plan.roi * 100:.2f}%)")
 
+    # Probe: what leg 1 was priced from and how long the order took, so a miss can be
+    # read as "someone beat us" (quote gone right after) or "never takeable" (still there).
+    probe = {"leg1": c1.venue, "limit1": limit1, "book1": _top(c1.book), "book2": _top(c2.book),
+             "age1": round(detected - c1.book.fetched_at, 3), "age2": round(detected - c2.book.fetched_at, 3)}
+    t_sent = time.time()
     f1 = brokers[c1.venue].buy(c1, plan.qty, limit1, notional_hint=notional1 + plan.qty * cfg.slippage)
+    t_back = time.time()
+    probe.update(sent_ms=round((t_sent - detected) * 1000, 1), back_ms=round((t_back - detected) * 1000, 1),
+                 exch_time=f1.raw.get("create_time") or f1.raw.get("created_time"))
     fills.append(f1)
     if f1.qty < max(c1.min_size, 0.01):
+        if cfg.live:
+            probe["after1"] = book_now(c1)
         return _record(db, mode, opp, plan, detected, fills, "missed", 0, 0,
-                       note=f"leg 1 no fill: {f1.error or f1.status}", log=log)
+                       note=f"leg 1 no fill: {f1.error or f1.status} · {probe_text(probe)}", log=log, probe=probe)
 
     q1 = f1.qty
     cost1 = (f1.notional + f1.fee) / q1
@@ -214,10 +259,11 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
                 note += " (partial size, rest unwound)"
 
     q_a, q_b = (qty1_held, hedged) if first == "a" else (hedged, qty1_held)
-    return _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note=note, log=log)
+    return _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note=note, log=log, probe=probe)
 
 
-def _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note="", log=print) -> dict:
+def _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note="", log=print,
+            probe: dict | None = None) -> dict:
     cash_out = -sum(f.cash for f in fills)
     hedged = min(q_a, q_b)
     locked = (hedged * opp.guaranteed - cash_out) if outcome == "hedged" else None
@@ -230,7 +276,8 @@ def _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note="", lo
                          "avg_a": plan.avg_price("a"), "avg_b": plan.avg_price("b")}),
         fills=json.dumps([f.as_dict() for f in fills]), outcome=outcome, qty_a=q_a, qty_b=q_b,
         cash_out=cash_out, locked_profit=locked, status=status,
-        pnl=(-cash_out if status == "closed" else None), note=note)
+        pnl=(-cash_out if status == "closed" else None), note=note,
+        probe=json.dumps(probe) if probe else None)
     cur = db.execute(f"INSERT INTO trades ({','.join(vals)}) VALUES ({','.join('?' * len(vals))})",
                      list(vals.values()))
     db.commit()

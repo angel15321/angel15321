@@ -196,8 +196,8 @@ class PolymarketUSParseTests(unittest.TestCase):
             def wait_for(self, slugs, timeout=2.0):
                 pass
 
-            def get(self, slug):
-                return md if slug == "live" else None
+            def get_at(self, slug):
+                return (123.0, md) if slug == "live" else None
         feed = FakeFeed()
         polymarket.use_feed(feed)
         try:
@@ -207,6 +207,7 @@ class PolymarketUSParseTests(unittest.TestCase):
             polymarket.use_feed(None)
         self.assertEqual(feed.asked, [["live", "nobook"]])
         self.assertEqual(out["live"][0].asks, [(0.42, 50.0)])
+        self.assertEqual(out["live"][0].fetched_at, 123.0)   # age counts from when the feed sent it
         self.assertNotIn("nobook", out)          # no live book -> no price, never a stale REST one
 
     def test_feed_stores_latest_book_and_goes_stale(self):
