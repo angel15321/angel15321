@@ -35,18 +35,39 @@ def split_teams(code: str, sport: str = "nfl") -> tuple[str, str] | None:
     return None
 
 
+_fee_cache: dict[tuple[str, bool], dict[str, FeeModel]] = {}
+
+
 def fee_models(direct_member: bool = False, sport: str = "nfl") -> dict[str, FeeModel]:
-    out = {}
+    """Fee schedule per series, read once per run (it was 3 extra requests on every scan)."""
+    if (sport, direct_member) in _fee_cache:
+        return _fee_cache[(sport, direct_member)]
+    out, ok = {}, True
     for s in SPORT_SERIES[sport]:
         try:
             info = http.get(f"{API}/series/{s}")["series"]
             out[s] = kalshi_model(info.get("fee_type"), info.get("fee_multiplier"), direct_member)
         except Exception:
-            out[s] = kalshi_model(None, None, direct_member)
+            out[s], ok = kalshi_model(None, None, direct_member), False
+    if ok:
+        _fee_cache[(sport, direct_member)] = out
     return out
 
 
+MARKETS_TTL = 30.0       # s: market LISTS are reused this long (lines rarely appear); books are re-read every scan
+_market_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
 def _markets(series: str) -> list[dict]:
+    hit = _market_cache.get(series)
+    if hit and time.time() - hit[0] < MARKETS_TTL:
+        return hit[1]
+    out = _markets_now(series)
+    _market_cache[series] = (time.time(), out)
+    return out
+
+
+def _markets_now(series: str) -> list[dict]:
     out, cursor = [], ""
     while True:
         params = {"series_ticker": series, "status": "open", "limit": 1000}
@@ -83,6 +104,7 @@ def fetch(horizon: dt.datetime, direct_member: bool = False, sport: str = "nfl")
     contracts: list[Contract] = []
     series_map = SPORT_SERIES[sport]
     game_series = next(s for s, k in series_map.items() if k == "ml")
+    shard_of: dict[str, int | None] = {}      # ticker -> exchange shard (orders trade against that shard's cash)
 
     for series, kind in series_map.items():
         for m in _markets(series):
@@ -103,6 +125,7 @@ def fetch(horizon: dt.datetime, direct_member: bool = False, sport: str = "nfl")
             g.links.setdefault(VENUE, f"https://kalshi.com/markets/{game_series.lower()}/{game_slug}")
 
             ticker = m["ticker"]
+            shard_of[ticker] = m.get("exchange_index")
             suffix = ticker.rsplit("-", 1)[1]
             common = dict(venue=VENUE, game=g.key, fee=fees[series],
                           url=f"https://kalshi.com/markets/{series.lower()}/{ev.lower()}",
@@ -147,6 +170,7 @@ def fetch(horizon: dt.datetime, direct_member: bool = False, sport: str = "nfl")
         pair = books.get(c.ref["ticker"])
         if pair:
             c.book = pair[0] if c.ref["side"] == "yes" else pair[1]
+        c.ref["shard"] = shard_of.get(c.ref["ticker"])
         games[c.game].contracts.append(c)
     return games
 

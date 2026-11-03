@@ -103,6 +103,7 @@ def match(event: dict, winner: dict, kalshi_events: dict[str, dict[str, dict]]) 
                 start=event.get("startTime"), kalshi_event=hits[0], series=hits[0].split("-")[0],
                 home=name[home], away=name[not home],
                 k_home=(k_long if home else k_short)["ticker"], k_away=(k_short if home else k_long)["ticker"],
+                shard=k_long.get("exchange_index"),
                 long_is_home=home)
 
 
@@ -146,9 +147,9 @@ def build(m: dict, kalshi_fee, poly_fee_override: float | None = None) -> Game:
     for ticker, player, yes_side in ((m["k_home"], g.home, "gt"), (m["k_away"], g.away, "lt")):
         no_side = "lt" if yes_side == "gt" else "gt"
         g.contracts.append(Contract(side=yes_side, label=wins[yes_side], how=f"YES {player}",
-                                    ref={"ticker": ticker, "side": "yes"}, **k_common))
+                                    ref={"ticker": ticker, "side": "yes", "shard": m.get("shard")}, **k_common))
         g.contracts.append(Contract(side=no_side, label=wins[no_side], how=f"NO {player}",
-                                    ref={"ticker": ticker, "side": "no"}, **k_common))
+                                    ref={"ticker": ticker, "side": "no", "shard": m.get("shard")}, **k_common))
     w = m["winner"]
     long_side = "gt" if m["long_is_home"] else "lt"
     fee = poly_model(w, poly_fee_override)

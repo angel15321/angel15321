@@ -186,7 +186,28 @@ class KalshiBroker:
             detail = e.read().decode(errors="replace")[:500]
             raise RuntimeError(f"Kalshi {method} {endpoint} → HTTP {e.code}: {detail}") from None
 
+    shards: dict[int, float] | None = None   # exchange shard -> $, from the last balance() read
+
     def balance(self) -> float:
+        """Cash across all shards, keeping `shards` = {exchange shard: $}. A market trades only against cash
+        on its own shard (NFL = 0, NBA and tennis = 3); a subaccount with none there gets 403
+        PERMISSION_DENIED_FOR_SUBTRADER (11-03)."""
+        try:
+            d = self._req("GET", "/portfolio/subaccounts/balances")
+        except RuntimeError as e:
+            if "429" in str(e):
+                raise
+            d = None
+        if d is not None:
+            rows = d.get("subaccount_balances") or []
+            # A restricted key sees only its own subaccount; an unrestricted one sees all -> its primary (0).
+            want = int(os.environ.get("KALSHI_SUBACCOUNT", "-1"))
+            if want < 0 and len({r.get("subaccount_number") for r in rows}) > 1:
+                want = 0
+            rows = [r for r in rows if want < 0 or int(r.get("subaccount_number", -1)) == want]
+            self.shards = {int(r["exchange_index"]): float(r["balance"]) for r in rows}
+            return sum(self.shards.values())
+        self.shards = None
         d = self._req("GET", "/portfolio/balance")
         if d.get("balance_dollars") is not None:
             return float(d["balance_dollars"])

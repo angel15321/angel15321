@@ -23,6 +23,7 @@ with paper brokers, so you can see fill rates and slippage before going live.
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import datetime as dt
 import json
 import os
@@ -48,7 +49,8 @@ CREATE TABLE IF NOT EXISTS trades (
   locked_profit REAL,             -- for fully hedged trades
   status TEXT,                    -- open | settled | closed
   payout REAL, pnl REAL, settled_at REAL, note TEXT,
-  probe TEXT                      -- leg-1 timing + books seen / right after (JSON)
+  probe TEXT,                     -- leg-1 timing + books seen / right after (JSON)
+  acked_at REAL                   -- operator acknowledged this failure (`arbscan ack`): ends a halt streak
 );
 CREATE INDEX IF NOT EXISTS trades_key ON trades(opp_key, detected_at);
 """
@@ -58,10 +60,21 @@ def connect(path: str) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
-    if "probe" not in {r[1] for r in db.execute("PRAGMA table_info(trades)")}:
-        db.execute("ALTER TABLE trades ADD COLUMN probe TEXT")      # ledgers from before the probe
-        db.commit()
+    cols = {r[1] for r in db.execute("PRAGMA table_info(trades)")}
+    for col, typ in (("probe", "TEXT"), ("acked_at", "REAL")):       # ledgers from before these columns
+        if col not in cols:
+            db.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
+            db.commit()
     return db
+
+
+def ack_failures(db, mode: str = "live") -> int:
+    """Mark every unacknowledged failed trade as reviewed, so the halt streak restarts from zero.
+    The positions themselves are untouched (held ones still settle and book their P&L)."""
+    n = db.execute("UPDATE trades SET acked_at=? WHERE mode=? AND acked_at IS NULL AND outcome IN "
+                   "('unwound','exposed','partial','error')", (time.time(), mode)).rowcount
+    db.commit()
+    return n
 
 
 @dataclass
@@ -86,6 +99,9 @@ class Config:
     max_failures: int = 2             # halt after this many unhedged/unwound trades in a row
     kill_file: str = "STOP"
     sports: tuple[str, ...] = ("nfl",)  # nfl | nba | tennis
+    legs: str = "sequential"          # sequential (stale leg first, then hedge) | parallel (both at once; a vanished
+                                      # quote then leaves the OTHER leg filled -- 11-03 every miss was a vanished quote)
+    max_book_age: float = 1.0         # s: an arb priced from an older Kalshi (REST) book is skipped
 
 
 # ---------------------------------------------------------------- helpers
@@ -113,11 +129,11 @@ def open_exposure(db, mode: str) -> float:
 
 
 def recent_failures(db, mode: str, n: int) -> int:
-    rows = db.execute("SELECT outcome FROM trades WHERE mode=? AND outcome!='missed' ORDER BY id DESC LIMIT ?",
+    rows = db.execute("SELECT outcome, acked_at FROM trades WHERE mode=? AND outcome!='missed' ORDER BY id DESC LIMIT ?",
                       (mode, n)).fetchall()
     streak = 0
     for r in rows:
-        if r["outcome"] in ("unwound", "exposed", "partial", "error"):
+        if r["outcome"] in ("unwound", "exposed", "partial", "error") and r["acked_at"] is None:
             streak += 1
         else:
             break
@@ -212,26 +228,49 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
     # read as "someone beat us" (quote gone right after) or "never takeable" (still there).
     probe = {"leg1": c1.venue, "limit1": limit1, "book1": _top(c1.book), "book2": _top(c2.book),
              "age1": round(detected - c1.book.fetched_at, 3), "age2": round(detected - c2.book.fetched_at, 3)}
+    # Cross-venue pairs send BOTH legs at once (--legs parallel): leg 2 no longer waits a round trip for
+    # leg 1. Each IOC is capped so that both legs filling at their limits still pays off.
+    parallel = cfg.legs == "parallel" and c1.venue != c2.venue
     t_sent = time.time()
-    f1 = brokers[c1.venue].buy(c1, plan.qty, limit1, notional_hint=notional1 + plan.qty * cfg.slippage)
+    f2 = None
+    if parallel:
+        unit1 = limit1 + c1.fee.per_contract(limit1)
+        limit2p = min(plan2[-1][0] + cfg.slippage, max_price_within(opp.guaranteed - unit1, c2))
+        probe["limit2"] = limit2p
+        notional2 = sum(p * q for p, q in plan2)
+        with cf.ThreadPoolExecutor(max_workers=2) as ex:
+            j1 = ex.submit(brokers[c1.venue].buy, c1, plan.qty, limit1,
+                           notional_hint=notional1 + plan.qty * cfg.slippage)
+            j2 = ex.submit(brokers[c2.venue].buy, c2, plan.qty, limit2p,
+                           notional_hint=notional2 + plan.qty * cfg.slippage)
+            f1, f2 = j1.result(), j2.result()
+    else:
+        f1 = brokers[c1.venue].buy(c1, plan.qty, limit1, notional_hint=notional1 + plan.qty * cfg.slippage)
     t_back = time.time()
     probe.update(sent_ms=round((t_sent - detected) * 1000, 1), back_ms=round((t_back - detected) * 1000, 1),
                  exch_time=f1.raw.get("create_time") or f1.raw.get("created_time"))
     fills.append(f1)
+    if f2 is not None:
+        fills.append(f2)
+        probe["fill2"] = f2.qty
+        if f2.qty > f1.qty:
+            # the leg that filled more is the one left to hedge: it plays "leg 1" from here on
+            c1, c2, f1, f2, first, second = c2, c1, f2, f1, second, first
     if f1.qty < max(c1.min_size, 0.01):
         if cfg.live:
             probe["after1"] = book_now(c1)
+        what = "neither leg filled" if parallel else "leg 1 no fill"
         return _record(db, mode, opp, plan, detected, fills, "missed", 0, 0,
-                       note=f"leg 1 no fill: {f1.error or f1.status} · {probe_text(probe)}", log=log, probe=probe)
+                       note=f"{what}: {f1.error or f1.status} · {probe_text(probe)}", log=log, probe=probe)
 
     q1 = f1.qty
     cost1 = (f1.notional + f1.fee) / q1
     # Leg-2 limit: break-even for the cost already paid (minus any required edge).
     limit2 = max_price_within(opp.guaranteed - cost1 - cfg.leg2_min_edge, c2)
     step = 0.01 if c2.venue == "Kalshi" else 0.01
-    remaining = floor_to(q1, step)
-    hedged = 0.0
-    for attempt in range(cfg.hedge_attempts):
+    hedged = f2.qty if f2 is not None else 0.0
+    remaining = floor_to(q1 - hedged, step)
+    for attempt in range(cfg.hedge_attempts - (1 if parallel else 0)):
         if remaining < max(c2.min_size if c2.venue == "Polymarket" else 0.01, 0.01):
             break
         f2 = brokers[c2.venue].buy(c2, remaining, limit2, notional_hint=remaining * limit2)
@@ -451,14 +490,27 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
         games = snap.games
     else:
         games = [g for g in snap.games if not g.started(now) and g.start is not None]
+    feed = polymarket._feed
+    if feed is not None:
+        # The Polymarket books were copied from the feed at the START of the scan; the Kalshi REST
+        # fetch then takes 1-3 s (11-03: every miss was priced from a 1.3-3.6 s old Polymarket book).
+        # Re-read them from the feed now: memory only, no network.
+        polymarket.refresh([c for g in games for c in g.contracts if c.venue == "Polymarket"])
     arbs, _ = engine.find(games, min_roi=cfg.min_roi, cross_venue_only=cfg.cross_venue_only)
     arbs = [o for o in engine.non_overlapping(arbs) if o.max.profit >= cfg.min_profit]
-    feed = polymarket._feed
+    # Kalshi books are REST snapshots: their age IS how stale they are. A Polymarket book is the feed's latest
+    # message, just re-read above; a quiet market can go many seconds without one and still be current
+    # (11-03 shadow: median 0.69 s, 44% > 1 s), so its age is not a staleness signal and is not gated.
+    t_now = time.time()
+    fresh = [o for o in arbs if all(t_now - x.book.fetched_at <= cfg.max_book_age
+                                    for x in (o.a, o.b) if x.venue == "Kalshi")]
+    stale_note = (f" · {len(arbs) - len(fresh)} skipped (Kalshi book > {cfg.max_book_age:g}s old)"
+                  if len(fresh) < len(arbs) else "")
     feed_note = " · Polymarket feed DOWN" if feed is not None and not feed.alive() else ""
     log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
-        f"{sum(len(g.contracts) for g in games):,} contracts · {len(arbs)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
-        + feed_note + (" · " + "; ".join(snap.errors) if snap.errors else ""))
-    for o in arbs:
+        f"{sum(len(g.contracts) for g in games):,} contracts · {len(fresh)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
+        + stale_note + feed_note + (" · " + "; ".join(snap.errors) if snap.errors else ""))
+    for o in fresh:
         if recently_taken(db, o.key, cfg.cooldown_min):
             continue
         room_day = cfg.max_daily_spend - spent_today(db, mode)
@@ -468,9 +520,16 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
         except Exception as e:
             log(f"! balance check failed: {e}")
             return
-        # Each leg is paid on its own venue: the smaller venue balance caps the pair.
-        venues = {o.a.venue, o.b.venue}
-        cash_cap = min(cash[v] for v in venues) * (2 if len(venues) == 2 else 1) * 0.95
+        # Each leg is paid on its own venue -- a Kalshi leg from its market's shard -- and the smaller
+        # pot caps the pair.
+        shards = getattr(brokers.get("Kalshi"), "shards", None)
+        pots = []
+        for leg in {o.a.venue: o.a, o.b.venue: o.b}.values():
+            pot = cash[leg.venue]
+            if leg.venue == "Kalshi" and shards is not None and leg.ref.get("shard") is not None:
+                pot = shards.get(int(leg.ref["shard"]), 0.0)
+            pots.append(pot)
+        cash_cap = min(pots) * (2 if len(pots) == 2 else 1) * 0.95
         budget = min(cfg.max_per_trade, room_day, room_open, cash_cap)
         if budget < 5:
             log(f"  skip {o.game.title}: limit reached (day ${room_day:.0f}, open ${room_open:.0f}, cash ${cash_cap:.0f})")

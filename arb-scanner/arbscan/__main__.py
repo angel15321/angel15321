@@ -46,7 +46,8 @@ def cmd_run(a):
         min_roi=a.min_roi, min_profit=a.min_profit, slippage=a.slippage, hedge_attempts=a.hedge_attempts,
         on_fail=a.on_fail, unwind_max_loss=a.unwind_max_loss, cooldown_min=a.cooldown, include_live_games=a.include_live_games or a.in_play_only,
         in_play_only=a.in_play_only, leg1=a.leg1,
-        cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports)
+        cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports,
+        legs=a.legs, max_book_age=a.max_book_age)
     log = _log_to(a.log)
     try:
         brokers = trader.make_brokers(cfg, kalshi_demo=a.kalshi_demo)
@@ -57,14 +58,17 @@ def cmd_run(a):
         bal = trader.startup_balances(brokers, log=log)
         log("=" * 72)
         log("LIVE TRADING — real orders will be placed.")
-        log(f"Balances: Kalshi ${bal['Kalshi']:,.2f} · Polymarket US ${bal['Polymarket']:,.2f}")
+        shards = getattr(brokers["Kalshi"], "shards", None)
+        by_shard = (" (" + ", ".join(f"shard {i} ${v:,.2f}" for i, v in sorted(shards.items())) + ")") if shards else ""
+        log(f"Balances: Kalshi ${bal['Kalshi']:,.2f}{by_shard} · Polymarket US ${bal['Polymarket']:,.2f}")
     else:
         log("DRY RUN — fills are simulated against live order books; nothing is sent. Add --live to trade.")
     log(f"Limits: ${cfg.max_per_trade:,.0f}/arb · ${cfg.max_daily_spend:,.0f}/day · ${cfg.max_open:,.0f} open · "
         f"min ROI {cfg.min_roi * 100:.2f}% · min profit ${cfg.min_profit:.2f} · on failed hedge: {cfg.on_fail}"
         f"{f' (loss <= fees + ${cfg.unwind_max_loss:.2f}/ct, else hold)' if cfg.on_fail == 'unwind' else ''} · "
         f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
-        f" · leg 1: {cfg.leg1} · sports: {', '.join(cfg.sports)}")
+        f" · legs: {cfg.legs}{'' if cfg.legs == 'parallel' else f' (leg 1: {cfg.leg1})'}"
+        f" · Kalshi books <= {cfg.max_book_age:g}s old · sports: {', '.join(cfg.sports)}")
     if not _attach_feed(log) and cfg.live:
         sys.exit("Live trading needs the Polymarket US websocket (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY): "
                  "the REST books lag the exchange by 10-30 s.")
@@ -104,6 +108,13 @@ def cmd_status(a):
               f"{r['game']:<10} {la['label']} {la['venue'][0]} + {lb['label']} {lb['venue'][0]:<3} "
               f"{r['outcome']:<8} {r['status']:<8} ${r['cash_out'] or 0:>8,.2f} "
               f"{('%+.2f' % pnl) if pnl is not None else '':>8}  {r['note'] or ''}")
+
+
+def cmd_ack(a):
+    db = trader.connect(a.db)
+    n = trader.ack_failures(db, "dry" if a.dry else "live")
+    print(f"acknowledged {n} failed trade(s); the halt streak starts again from zero. "
+          "Held positions are unchanged and still settle.")
 
 
 def cmd_scan(a):
@@ -177,6 +188,11 @@ def main(argv=None):
                    help="ONLY games in progress; scans just those games, so pair it with a short --interval")
     r.add_argument("--leg1", choices=["auto", "polymarket", "kalshi"], default="auto",
                    help="which venue's leg to buy first; auto = the stale venue in-play, else Polymarket")
+    r.add_argument("--legs", choices=["sequential", "parallel"], default="sequential",
+                   help="cross-venue pairs: leg 1 first, then leg 2 (default), or both at once -- faster, but a "
+                        "quote that vanishes leaves the other leg filled and held")
+    r.add_argument("--max-book-age", type=float, default=1.0,
+                   help="skip an arb priced from a Kalshi book older than this many seconds (default 1.0); Polymarket books are re-read from the live feed right before pricing")
     r.add_argument("--cross-venue-only", action="store_true")
     r.add_argument("--cooldown", type=float, default=10, help="minutes before re-taking the same pair")
     r.add_argument("--max-failures", type=int, default=2, help="halt after N failed hedges in a row")
@@ -199,6 +215,11 @@ def main(argv=None):
     s.add_argument("--db", default="trades.db")
     s.add_argument("--last", type=int, default=20)
     s.set_defaults(fn=cmd_status)
+
+    ak = sub.add_parser("ack", help="acknowledge failed trades after reviewing them, so a halted bot can run again")
+    ak.add_argument("--db", default="trades.db")
+    ak.add_argument("--dry", action="store_true", help="the dry-run ledger rows instead of live ones")
+    ak.set_defaults(fn=cmd_ack)
 
     sc = sub.add_parser("scan", help="one scan: arbs and closest misses")
     sc.add_argument("--days", type=float, default=8)
