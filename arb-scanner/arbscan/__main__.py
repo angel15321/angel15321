@@ -46,7 +46,7 @@ def cmd_run(a):
         min_roi=a.min_roi, min_profit=a.min_profit, slippage=a.slippage, hedge_attempts=a.hedge_attempts,
         on_fail=a.on_fail, cooldown_min=a.cooldown, include_live_games=a.include_live_games or a.in_play_only,
         in_play_only=a.in_play_only, leg1=a.leg1,
-        cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file)
+        cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports)
     log = _log_to(a.log)
     try:
         brokers = trader.make_brokers(cfg, kalshi_demo=a.kalshi_demo)
@@ -63,7 +63,7 @@ def cmd_run(a):
     log(f"Limits: ${cfg.max_per_trade:,.0f}/arb · ${cfg.max_daily_spend:,.0f}/day · ${cfg.max_open:,.0f} open · "
         f"min ROI {cfg.min_roi * 100:.2f}% · min profit ${cfg.min_profit:.2f} · on failed hedge: {cfg.on_fail} · "
         f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
-        f" · leg 1: {cfg.leg1}")
+        f" · leg 1: {cfg.leg1} · sports: {', '.join(cfg.sports)}")
     if not _attach_feed(log) and cfg.live:
         sys.exit("Live trading needs the Polymarket US websocket (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY): "
                  "the REST books lag the exchange by 10-30 s.")
@@ -107,14 +107,14 @@ def cmd_status(a):
 
 def cmd_scan(a):
     _attach_feed()
-    snap = scanner.snapshot(a.days)
+    snap = scanner.snapshot(a.days, sports=a.sports)
     arbs, closest = engine.find(snap.games, a.min_roi, a.cross_venue_only, near=0.03)
     print(report.text(snap, engine.non_overlapping(arbs), closest))
 
 
 def cmd_liquidity(a):
     _attach_feed()
-    snap = scanner.snapshot(a.days)
+    snap = scanner.snapshot(a.days, sports=a.sports)
     print(f"{'GAME':<10} {'VENUE':<10} {'MARKET':<9} {'MAIN LINE':<11} {'BID/ASK':>13} {'SPRD':>5} "
           f"{'DEPTH≤2¢':>11} {'LINES':>5} {'24H VOL':>9}")
     for g in snap.games:
@@ -134,6 +134,17 @@ def cmd_fees(a):
     for (pr, kf, kp), (_, pf, pp) in zip(fees.fee_table(k), fees.fee_table(p)):
         be = (k.per_contract(pr) + p.per_contract(1 - pr)) * 100
         print(f"{pr * 100:5.0f}¢ {kf:11.2f} {kp * 100:5.2f}% {pf:9.2f} {pp * 100:5.2f}% {be:14.2f}¢")
+
+
+SPORTS = ("nfl", "tennis")
+
+
+def _sports(text: str) -> tuple[str, ...]:
+    out = tuple(dict.fromkeys(s.strip().lower() for s in text.split(",") if s.strip()))
+    bad = [s for s in out if s not in SPORTS]
+    if bad or not out:
+        raise argparse.ArgumentTypeError(f"--sports takes a comma list of {', '.join(SPORTS)} (got {text!r})")
+    return out
 
 
 def main(argv=None):
@@ -172,6 +183,8 @@ def main(argv=None):
     r.add_argument("--kill-file", default="STOP")
     r.add_argument("--kalshi-demo", action="store_true", help="send Kalshi orders to the demo exchange")
     r.add_argument("--once", action="store_true", help="single scan then exit")
+    r.add_argument("--sports", type=_sports, default=("nfl",),
+                   help="comma list: nfl (moneylines + spreads), tennis (ATP/WTA/Challenger match winners); default nfl")
     r.set_defaults(fn=cmd_run)
 
     c = sub.add_parser("check", help="verify API keys and show balances")
@@ -187,10 +200,12 @@ def main(argv=None):
     sc.add_argument("--days", type=float, default=8)
     sc.add_argument("--min-roi", type=float, default=0.0)
     sc.add_argument("--cross-venue-only", action="store_true")
+    sc.add_argument("--sports", type=_sports, default=("nfl",))
     sc.set_defaults(fn=cmd_scan)
 
     lq = sub.add_parser("liquidity", help="main-line bid/ask, spread and depth per game")
     lq.add_argument("--days", type=float, default=3)
+    lq.add_argument("--sports", type=_sports, default=("nfl",))
     lq.set_defaults(fn=cmd_liquidity)
 
     f = sub.add_parser("fees", help="fee formulas and tables")

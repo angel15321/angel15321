@@ -90,18 +90,29 @@ class Game:
     start: dt.datetime | None = None
     links: dict[str, str] = field(default_factory=dict)
     contracts: list[Contract] = field(default_factory=list)
+    sport: str = "nfl"
+    uid: str = ""             # unique key when names can repeat (tennis: the Polymarket event slug)
+    live: bool | None = None  # the venue's own in-progress flag; None = judge by start time
 
     @property
     def key(self) -> str:
-        return f"{self.away}@{self.home}"
+        return self.uid or f"{self.away}@{self.home}"
 
     @property
     def title(self) -> str:
-        return f"{self.away} @ {self.home}"
+        return f"{self.away} v {self.home}" if self.sport == "tennis" else f"{self.away} @ {self.home}"
 
     @property
     def long_title(self) -> str:
+        if self.sport != "nfl":
+            return self.title
         return f"{nickname(self.away)} @ {nickname(self.home)}"
+
+    def started(self, now: dt.datetime) -> bool:
+        """In progress (or over). Tennis start times are schedule slots, so the live flag wins when there is one."""
+        if self.live is not None:
+            return self.live
+        return self.start is not None and self.start <= now
 
 
 def spread_label(game: Game, team: str, cover_by: float) -> str:

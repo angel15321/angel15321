@@ -96,6 +96,19 @@ In-play only, scanning faster:
 python -m arbscan run --live --in-play-only --interval 3 --max-per-trade 20 --max-daily 25
 ```
 
+NFL and tennis together (`--sports`, default `nfl`):
+
+```bash
+python -m arbscan run --live --in-play-only --interval 3 --max-per-trade 20 --max-daily 25 --sports nfl,tennis
+```
+
+**Tennis** = ATP, WTA and ATP Challenger match winners (Polymarket US has no ITF). A match is paired
+across venues by date + both players' 3-letter codes + the last name, and only when exactly one
+Kalshi event fits. In-play for tennis follows Polymarket's own live flag, not the schedule slot
+(matches often start hours late). The limits are shared with NFL. A retirement settles both venues
+to the player who advances; a walkover (match never started) is not checked here, which is one more
+reason to keep tennis `--in-play-only`.
+
 `--kalshi-demo` sends the Kalshi side to Kalshi's demo exchange instead.
 
 ## Risk controls (all on by default)

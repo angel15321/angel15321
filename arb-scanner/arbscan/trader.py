@@ -84,6 +84,7 @@ class Config:
     cross_venue_only: bool = False
     max_failures: int = 2             # halt after this many unhedged/unwound trades in a row
     kill_file: str = "STOP"
+    sports: tuple[str, ...] = ("nfl",)  # nfl | tennis
 
 
 # ---------------------------------------------------------------- helpers
@@ -137,7 +138,7 @@ def first_leg(opp: engine.Opportunity, cfg: Config, moves: dict[str, float] | No
     if cfg.leg1 in ("polymarket", "kalshi"):
         want = "Polymarket" if cfg.leg1 == "polymarket" else "Kalshi"
         return "a" if a.venue == want else "b"
-    live = opp.game.start is not None and opp.game.start <= dt.datetime.now(dt.timezone.utc)
+    live = opp.game.started(dt.datetime.now(dt.timezone.utc))
     ma, mb = (moves or {}).get(a.id), (moves or {}).get(b.id)
     if live and ma is not None and mb is not None and abs(ma - mb) >= 0.005:
         return "a" if ma < mb else "b"
@@ -419,15 +420,17 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
     mode = "live" if cfg.live else "dry"
     # In-play scans only fetch games starting within 30 min (Kalshi kickoffs are
     # estimates, so the exact in-progress filter is applied below).
-    snap = scanner.snapshot(min(days, 0.02) if cfg.in_play_only else days)
+    snap = scanner.snapshot(min(days, 0.02) if cfg.in_play_only else days, sports=cfg.sports)
     now = dt.datetime.now(dt.timezone.utc)
     moves = _moves(snap.games)
     if cfg.in_play_only:
-        games = [g for g in snap.games if g.start and now - dt.timedelta(hours=5) < g.start <= now]
+        # A game with a venue live flag (tennis) is in play exactly while the flag is on.
+        games = [g for g in snap.games if g.started(now)
+                 and (g.live is not None or now - dt.timedelta(hours=5) < g.start)]
     elif cfg.include_live_games:
         games = snap.games
     else:
-        games = [g for g in snap.games if g.start and g.start > now]
+        games = [g for g in snap.games if not g.started(now) and g.start is not None]
     arbs, _ = engine.find(games, min_roi=cfg.min_roi, cross_venue_only=cfg.cross_venue_only)
     arbs = [o for o in engine.non_overlapping(arbs) if o.max.profit >= cfg.min_profit]
     feed = polymarket._feed
