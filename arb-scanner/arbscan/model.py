@@ -96,7 +96,10 @@ class Game:
 
     @property
     def key(self) -> str:
-        return self.uid or f"{self.away}@{self.home}"
+        if self.uid:
+            return self.uid
+        # NFL keeps its bare key; other leagues are prefixed (DEN@MIN can be an NFL and an NBA game the same night)
+        return f"{self.away}@{self.home}" if self.sport == "nfl" else f"{self.sport}:{self.away}@{self.home}"
 
     @property
     def title(self) -> str:

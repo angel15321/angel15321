@@ -1,4 +1,4 @@
-"""Polymarket US adapter: NFL moneyline and full-game spread markets + order books.
+"""Polymarket US adapter: NFL moneyline + full-game spread, NBA moneyline + full-game spread + total, and order books.
 
 Market lists come from the PUBLIC gateway (gateway.polymarket.us). Order books
 come from the live markets websocket (pmws.BookFeed, needs the API key) when one
@@ -12,8 +12,8 @@ NO is a short of that instrument, so each market yields two contracts here:
     short  pays when it does not                      (buy  = ORDER_INTENT_BUY_SHORT)
 
 A short ask at p is a long bid at 1-p, so one order book prices both.
-NFL totals are not listed on Polymarket US (11-2026), so only moneylines and
-full-game spreads are mapped; half/quarter spreads have no Kalshi match.
+NFL totals are not listed on Polymarket US (11-2026), so NFL maps moneylines and
+full-game spreads; NBA also maps full-game totals. Half/quarter lines have no Kalshi match.
 """
 from __future__ import annotations
 
@@ -23,12 +23,17 @@ import time
 
 from . import http
 from .fees import poly_model
-from .model import Book, Contract, Game, margin_contract_label
+from .model import Book, Contract, Game, margin_contract_label, total_label
 from .teams import from_code
 
 GATEWAY = "https://gateway.polymarket.us"
 VENUE = "Polymarket"
-KINDS = {"football_team_full_game_winner": "ml", "football_team_full_game_spread": "spread"}
+SPORT_KINDS = {
+    "nfl": {"football_team_full_game_winner": "ml", "football_team_full_game_spread": "spread"},
+    "nba": {"basketball_team_full_game_winner": "ml", "basketball_team_full_game_spread": "spread",
+            "basketball_team_full_game_total": "total"},
+}
+KINDS = SPORT_KINDS["nfl"]
 EVENT_TTL = 600          # seconds to cache each game's market list (lines rarely change)
 _events: dict[str, tuple[float, list[dict]]] = {}
 
@@ -49,24 +54,24 @@ def _levels(rows: list[dict]) -> list[tuple[float, float]]:
     return out
 
 
-def _events_for_league() -> list[dict]:
-    """Every NFL game event with its start time and live flag (markets fetched per event)."""
+def _events_for_league(league: str = "nfl") -> list[dict]:
+    """Every game event of the league with its start time and live flag (markets fetched per event)."""
     out, offset = [], 0
     while True:
-        d = http.get(f"{GATEWAY}/v2/leagues/nfl/events", {"limit": 100, "offset": offset})
+        d = http.get(f"{GATEWAY}/v2/leagues/{league}/events", {"limit": 100, "offset": offset})
         page = d.get("events") or []
-        out += [e for e in page if str(e.get("slug", "")).startswith("nfl-")]
+        out += [e for e in page if str(e.get("slug", "")).startswith(f"{league}-")]
         if len(page) < 100:
             return out
         offset += 100
 
 
-def _event_markets(slug: str) -> list[dict]:
+def _event_markets(slug: str, kinds: dict = KINDS) -> list[dict]:
     hit = _events.get(slug)
     if hit and time.time() - hit[0] < EVENT_TTL:
         return hit[1]
     ms = (http.get(f"{GATEWAY}/v1/events/slug/{slug}").get("event") or {}).get("markets") or []
-    ms = [m for m in ms if m.get("sportsMarketType") in KINDS]
+    ms = [m for m in ms if m.get("sportsMarketType") in kinds]
     _events[slug] = (time.time(), ms)
     return ms
 
@@ -126,55 +131,65 @@ def fetch_books(slugs: list[str]) -> dict[str, tuple[Book, Book]]:
     return out
 
 
-def _teams(event: dict, m: dict) -> tuple[str, str] | None:
-    """(away, home). Market sides carry `ordering`; else the slug is nfl-away-home-date."""
+def _teams(event: dict, m: dict, sport: str = "nfl") -> tuple[str, str] | None:
+    """(away, home). Market sides carry `ordering`; else the slug is <league>-away-home-date."""
     order = {}
     for s in m.get("marketSides") or []:
         t = s.get("team") or {}
-        code = from_code(t.get("abbreviation") or "")
+        code = from_code(t.get("abbreviation") or "", sport)
         if code and t.get("ordering") in ("away", "home"):
             order[t["ordering"]] = code
     if "away" in order and "home" in order:
         return order["away"], order["home"]
     parts = event["slug"].split("-")
-    a, h = from_code(parts[1]), from_code(parts[2])
+    a, h = from_code(parts[1], sport), from_code(parts[2], sport)
     return (a, h) if a and h else None
 
 
-def parse_event(e: dict, markets: list[dict], fee_override: float | None = None) -> tuple[Game | None, list[Contract]]:
-    """One NFL event + its markets -> (Game, contracts without books)."""
+def parse_event(e: dict, markets: list[dict], fee_override: float | None = None,
+                sport: str = "nfl") -> tuple[Game | None, list[Contract]]:
+    """One event + its markets -> (Game, contracts without books)."""
     start = dt.datetime.fromisoformat(e["startTime"].replace("Z", "+00:00")) if e.get("startTime") else None
+    kinds = SPORT_KINDS[sport]
     g, out = None, []
     for m in markets:
-        kind = KINDS.get(m.get("sportsMarketType"))
+        kind = kinds.get(m.get("sportsMarketType"))
         if not kind or m.get("closed") or not m.get("active", True):
             continue
-        teams = _teams(e, m)
+        teams = _teams(e, m, sport)
         long_side = next((s for s in m.get("marketSides") or [] if s.get("long")), None)
         if not teams or not long_side:
             continue
         away, home = teams
-        t = from_code((long_side.get("team") or {}).get("abbreviation") or "")
-        if t not in (away, home):
-            continue
-        if g is None:
-            g = Game(away, home, start)
-            g.links[VENUE] = f"https://polymarket.us/event/{e['slug']}"
-        if kind == "ml":
-            s_long, line = ("gt" if t == home else "lt"), 0.0
-        else:
+        if kind == "total":
+            # sides are Over (long) / Under, no team
             ln = _f(m.get("line"))
-            if ln is None or ln == int(ln):
+            if ln is None or ln == int(ln) or (long_side.get("description") or "").lower() != "over":
                 continue
-            # long = team t covers `ln`, i.e. wins by more than -ln
-            need = -ln
-            s_long, line = ("gt", need) if t == home else ("lt", -need)
+            axis, s_long, line = "total", "gt", ln
+        else:
+            t = from_code((long_side.get("team") or {}).get("abbreviation") or "", sport)
+            if t not in (away, home):
+                continue
+            axis = "margin"
+            if kind == "ml":
+                s_long, line = ("gt" if t == home else "lt"), 0.0
+            else:
+                ln = _f(m.get("line"))
+                if ln is None or ln == int(ln):
+                    continue
+                # long = team t covers `ln`, i.e. wins by more than -ln
+                need = -ln
+                s_long, line = ("gt", need) if t == home else ("lt", -need)
+        if g is None:
+            g = Game(away, home, start, sport=sport)
+            g.links[VENUE] = f"https://polymarket.us/event/{e['slug']}"
         s_short = "lt" if s_long == "gt" else "gt"
         fee = poly_model(m, fee_override)
         for side, s in ((s_long, "long"), (s_short, "short")):
             out.append(Contract(
-                venue=VENUE, game=g.key, axis="margin", side=side, line=line, kind=kind, tie_half=kind == "ml",
-                label=margin_contract_label(g, side, line, kind),
+                venue=VENUE, game=g.key, axis=axis, side=side, line=line, kind=kind, tie_half=kind == "ml",
+                label=total_label(side, line) if kind == "total" else margin_contract_label(g, side, line, kind),
                 how=f"{'BUY_LONG' if s == 'long' else 'BUY_SHORT'} on \"{m.get('question')}\"",
                 fee=fee, url=g.links[VENUE], min_size=_f(m.get("minimumTradeQty")) or 1.0,
                 tick=_f(m.get("orderPriceMinTickSize")) or 0.01,
@@ -183,15 +198,15 @@ def parse_event(e: dict, markets: list[dict], fee_override: float | None = None)
     return g, out
 
 
-def fetch(horizon: dt.datetime, fee_override: float | None = None) -> dict[str, Game]:
+def fetch(horizon: dt.datetime, fee_override: float | None = None, sport: str = "nfl") -> dict[str, Game]:
     now = dt.datetime.now(dt.timezone.utc)
     games: dict[str, Game] = {}
     contracts: list[Contract] = []
-    for e in _events_for_league():
+    for e in _events_for_league(sport):
         start = dt.datetime.fromisoformat(e["startTime"].replace("Z", "+00:00")) if e.get("startTime") else None
         if start and (start > horizon or start < now - dt.timedelta(hours=5)):
             continue
-        g, cs = parse_event(e, _event_markets(e["slug"]), fee_override)
+        g, cs = parse_event(e, _event_markets(e["slug"], SPORT_KINDS[sport]), fee_override, sport)
         if g:
             games.setdefault(g.key, g).links.update(g.links)
             contracts += cs

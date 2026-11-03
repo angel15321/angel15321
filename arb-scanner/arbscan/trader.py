@@ -85,7 +85,7 @@ class Config:
     cross_venue_only: bool = False
     max_failures: int = 2             # halt after this many unhedged/unwound trades in a row
     kill_file: str = "STOP"
-    sports: tuple[str, ...] = ("nfl",)  # nfl | tennis
+    sports: tuple[str, ...] = ("nfl",)  # nfl | nba | tennis
 
 
 # ---------------------------------------------------------------- helpers

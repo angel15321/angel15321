@@ -24,12 +24,13 @@ def snapshot(days: float = 8, poly_fee: float | None = None, kalshi_direct: bool
     errors: list[str] = []
     results: dict[str, dict[str, Game]] = {}
     jobs = {}
-    if "nfl" in sports:
-        jobs["Polymarket"] = lambda: polymarket.fetch(horizon, poly_fee)
-        jobs["Kalshi"] = lambda: kalshi.fetch(horizon, kalshi_direct)
+    for sp in ("nfl", "nba"):
+        if sp in sports:
+            jobs[f"Polymarket {sp}"] = lambda sp=sp: polymarket.fetch(horizon, poly_fee, sp)
+            jobs[f"Kalshi {sp}"] = lambda sp=sp: kalshi.fetch(horizon, kalshi_direct, sp)
     if "tennis" in sports:
         jobs["Tennis"] = lambda: tennis.fetch(horizon, poly_fee, kalshi_direct)   # both venues, already paired
-    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+    with cf.ThreadPoolExecutor(max_workers=len(jobs) or 1) as ex:
         futs = {ex.submit(fn): name for name, fn in jobs.items()}
         for f in cf.as_completed(futs):
             name = futs[f]
@@ -41,9 +42,9 @@ def snapshot(days: float = 8, poly_fee: float | None = None, kalshi_direct: bool
 
     merged: dict[str, Game] = {}
     # Polymarket first: its kickoff times are exact; Kalshi's are estimated.
-    for name in ("Polymarket", "Kalshi"):
+    for name in [n for n in results if n.startswith("Polymarket")] + [n for n in results if n.startswith("Kalshi")]:
         for key, g in results.get(name, {}).items():
-            m = merged.setdefault(key, Game(g.away, g.home, g.start))
+            m = merged.setdefault(key, Game(g.away, g.home, g.start, sport=g.sport))
             if m.start is None:
                 m.start = g.start
             m.links.update(g.links)

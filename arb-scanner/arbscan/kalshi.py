@@ -1,4 +1,4 @@
-"""Kalshi adapter: NFL moneyline, spread and total markets + order books."""
+"""Kalshi adapter: NFL and NBA moneyline, spread and total markets + order books."""
 from __future__ import annotations
 
 import datetime as dt
@@ -11,7 +11,11 @@ from .model import Book, Contract, Game, margin_contract_label, total_label
 from .teams import from_code
 
 API = "https://api.elections.kalshi.com/trade-api/v2"
-SERIES = {"KXNFLGAME": "ml", "KXNFLSPREAD": "spread", "KXNFLTOTAL": "total"}
+SPORT_SERIES = {
+    "nfl": {"KXNFLGAME": "ml", "KXNFLSPREAD": "spread", "KXNFLTOTAL": "total"},
+    "nba": {"KXNBAGAME": "ml", "KXNBASPREAD": "spread", "KXNBATOTAL": "total"},
+}
+SERIES = SPORT_SERIES["nfl"]
 VENUE = "Kalshi"
 
 
@@ -22,18 +26,18 @@ def _f(x) -> float | None:
         return None
 
 
-def split_teams(code: str) -> tuple[str, str] | None:
+def split_teams(code: str, sport: str = "nfl") -> tuple[str, str] | None:
     """'KCDEN' -> ('KC', 'DEN'): first team is away, second is home."""
     for i in range(2, len(code) - 1):
-        a, h = from_code(code[:i]), from_code(code[i:])
+        a, h = from_code(code[:i], sport), from_code(code[i:], sport)
         if a and h:
             return a, h
     return None
 
 
-def fee_models(direct_member: bool = False) -> dict[str, FeeModel]:
+def fee_models(direct_member: bool = False, sport: str = "nfl") -> dict[str, FeeModel]:
     out = {}
-    for s in SERIES:
+    for s in SPORT_SERIES[sport]:
         try:
             info = http.get(f"{API}/series/{s}")["series"]
             out[s] = kalshi_model(info.get("fee_type"), info.get("fee_multiplier"), direct_member)
@@ -73,26 +77,30 @@ def fetch_books(tickers: list[str]) -> dict[str, tuple[Book, Book]]:
     return out
 
 
-def fetch(horizon: dt.datetime, direct_member: bool = False) -> dict[str, Game]:
-    fees = fee_models(direct_member)
+def fetch(horizon: dt.datetime, direct_member: bool = False, sport: str = "nfl") -> dict[str, Game]:
+    fees = fee_models(direct_member, sport)
     games: dict[str, Game] = {}
     contracts: list[Contract] = []
+    series_map = SPORT_SERIES[sport]
+    game_series = next(s for s, k in series_map.items() if k == "ml")
 
-    for series, kind in SERIES.items():
+    for series, kind in series_map.items():
         for m in _markets(series):
             ev = m["event_ticker"]                       # KXNFLSPREAD-26NOV01KCDEN
             tail = ev.rsplit("-", 1)[1]
-            teams = split_teams(tail[7:])
+            teams = split_teams(tail[7:], sport)
             if not teams:
                 continue
             away, home = teams
+            # occurrence = kickoff + ~3 h on both NFL and NBA (Polymarket's exact start wins in the merge)
             occ = m.get("occurrence_datetime") or m.get("expected_expiration_time")
             start = (dt.datetime.fromisoformat(occ.replace("Z", "+00:00")) - dt.timedelta(hours=3)) if occ else None
             if start and start > horizon:
                 continue
-            g = games.setdefault(f"{away}@{home}", Game(away, home, start))
-            game_slug = f"KXNFLGAME-{tail}".lower()
-            g.links.setdefault(VENUE, f"https://kalshi.com/markets/kxnflgame/{game_slug}")
+            new = Game(away, home, start, sport=sport)
+            g = games.setdefault(new.key, new)
+            game_slug = f"{game_series}-{tail}".lower()
+            g.links.setdefault(VENUE, f"https://kalshi.com/markets/{game_series.lower()}/{game_slug}")
 
             ticker = m["ticker"]
             suffix = ticker.rsplit("-", 1)[1]
@@ -101,7 +109,7 @@ def fetch(horizon: dt.datetime, direct_member: bool = False) -> dict[str, Game]:
                           volume_24h=_f(m.get("volume_24h_fp")), open_interest=_f(m.get("open_interest_fp")))
 
             if kind == "ml":
-                team = from_code(suffix)
+                team = from_code(suffix, sport)
                 if team not in (away, home):
                     continue
                 yes_side = "gt" if team == home else "lt"
@@ -113,7 +121,7 @@ def fetch(horizon: dt.datetime, direct_member: bool = False) -> dict[str, Game]:
                                               label=margin_contract_label(g, side, 0.0, "ml"), how=how,
                                               ref={"ticker": ticker, "side": s}, **common))
             elif kind == "spread":
-                team = from_code(re.sub(r"\d+$", "", suffix))
+                team = from_code(re.sub(r"\d+$", "", suffix), sport)
                 x = _f(m.get("floor_strike"))
                 if team not in (away, home) or x is None or x == int(x):
                     continue
