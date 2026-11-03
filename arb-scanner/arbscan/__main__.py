@@ -58,7 +58,7 @@ def cmd_run(a):
         in_play_only=a.in_play_only, leg1=a.leg1,
         cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports,
         legs=a.legs, max_book_age=a.max_book_age, trigger=a.trigger, event_gap=a.event_gap_ms / 1000,
-        confirm_s=a.confirm_ms / 1000)
+        confirm_s=a.confirm_ms / 1000, stale_pm=a.stale_pm, hedge_max_loss=a.hedge_max_loss)
     log = _log_to(a.log)
     try:
         brokers = trader.make_brokers(cfg, kalshi_demo=a.kalshi_demo)
@@ -79,6 +79,8 @@ def cmd_run(a):
         f"{f' (loss <= fees + ${cfg.unwind_max_loss:.2f}/ct, else hold)' if cfg.on_fail == 'unwind' else ''} · "
         f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
         f" · legs: {cfg.legs}{'' if cfg.legs == 'parallel' else f' (leg 1: {cfg.leg1})'}"
+        f"{' · stale Polymarket leg: skip' if cfg.stale_pm == 'skip' else ' · stale Polymarket leg: try first'}"
+        f"{f' · hedge may pay {cfg.hedge_max_loss * 100:.1f} c/ct over break-even' if cfg.hedge_max_loss else ''}"
         f" · Kalshi books <= {cfg.max_book_age:g}s old"
         + (f" · trigger: every book change (confirm {cfg.confirm_s * 1000:.0f} ms, per game <= 1/{cfg.event_gap * 1000:.0f} ms)"
            if cfg.trigger == "event" else f" · trigger: scan every {max(1.0, a.interval):g}s")
@@ -205,6 +207,12 @@ def main(argv=None):
     r.add_argument("--legs", choices=["sequential", "parallel"], default="sequential",
                    help="cross-venue pairs: leg 1 first, then leg 2 (default), or both at once -- faster, but a "
                         "quote that vanishes leaves the other leg filled and held")
+    r.add_argument("--stale-pm", choices=["skip", "first"], default="skip",
+                   help="in-play arb whose stale leg (leg 1) is Polymarket: skip it (default; PM-first IOCs went 0/38, "
+                        "its API takes 85-385 ms and the quote is gone first) or try it first")
+    r.add_argument("--hedge-max-loss", type=float, default=0.0,
+                   help="$/contract leg 2 may pay above break-even to get hedged (default 0: break-even only); a small "
+                        "locked loss instead of a one-sided hold")
     r.add_argument("--trigger", choices=["scan", "event"], default="scan",
                    help="scan: price once per scan (default). event: also re-check a game the moment either feed "
                         "changes one of its books (needs both websockets)")

@@ -36,8 +36,12 @@ python -m arbscan run
    **stale** venue: after a score one venue reprices first and the other's old quotes get
    pulled, so the leg whose price moved least since the last scan goes first. Pre-game
    (or with no history yet) the Polymarket leg goes first. `--leg1 polymarket|kalshi` forces it.
+   With `--trigger event` the venue whose book change triggered the check is the FRESH one, so the other
+   venue's leg goes first. An in-play arb whose stale leg is Polymarket is skipped by default
+   (`--stale-pm skip`): its order API takes 85-385 ms and such quotes were gone every time (0/38 fills).
 5. **Leg 2.** It buys exactly what leg 1 filled, as an immediate-or-cancel order capped
-   at the **break-even price**, and retries up to 3 times.
+   at the **break-even price** (plus `--hedge-max-loss` $/contract if you allow a bounded locked loss),
+   and retries up to 3 times; before each retry it checks the feed's in-memory book and stops when the quote is gone.
 6. **If the hedge fails,** it sells leg 1 back (`--on-fail unwind`, the default) or
    keeps it (`--on-fail hold`).
 7. **Log and settle.** Every order goes into `trades.db` and `arbscan.log`. After

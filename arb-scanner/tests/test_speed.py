@@ -84,7 +84,7 @@ class TickTests(Base):
         o.game.live = True
         seen = {}
 
-        def run(db, opp_, brokers_, cfg_, budget, log, moves=None, leg_budgets=None):
+        def run(db, opp_, brokers_, cfg_, budget, log, moves=None, leg_budgets=None, **kw):
             seen["budget"], seen["legs"] = budget, leg_budgets
             return {}
         if kalshi_shards is not None:
@@ -100,14 +100,14 @@ class TickTests(Base):
     def test_stale_kalshi_book_skipped(self):
         o = opp([(0.45, 100)], [(0.50, 100)])          # a = Kalshi, b = Polymarket
         o.a.book.fetched_at, o.b.book.fetched_at = time.time() - 2.0, time.time()
-        seen, _, logs = self._tick(o, trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True))
+        seen, _, logs = self._tick(o, trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True, stale_pm="first"))
         self.assertNotIn("budget", seen)
         self.assertIn("skipped (Kalshi book > 1s old)", logs[0])
 
     def test_quiet_polymarket_book_is_not_stale(self):
         o = opp([(0.45, 100)], [(0.50, 100)])
         o.a.book.fetched_at, o.b.book.fetched_at = time.time(), time.time() - 30.0
-        seen, _, _ = self._tick(o, trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True))
+        seen, _, _ = self._tick(o, trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True, stale_pm="first"))
         self.assertIn("budget", seen)
 
     def test_fresh_book_traded_and_feed_reread(self):
@@ -115,7 +115,7 @@ class TickTests(Base):
         o.a.book.fetched_at = o.b.book.fetched_at = time.time()
         feed = mock.Mock()
         feed.alive.return_value = True
-        seen, pr, _ = self._tick(o, trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True), feed=feed)
+        seen, pr, _ = self._tick(o, trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True, stale_pm="first"), feed=feed)
         self.assertIn("budget", seen)
         pr.assert_called_once()                        # Polymarket books re-read from the feed before pricing
         self.assertEqual([x.venue for x in pr.call_args[0][0]], ["Polymarket"])
@@ -124,7 +124,7 @@ class TickTests(Base):
         o = opp([(0.45, 100)], [(0.50, 100)])          # a = Kalshi
         o.a.ref["shard"] = 0
         o.a.book.fetched_at = o.b.book.fetched_at = time.time()
-        cfg = trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True)
+        cfg = trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True, stale_pm="first")
         seen, _, logs = self._tick(o, cfg, kalshi_shards={0: 0.0, 3: 25.0})
         self.assertNotIn("budget", seen)               # $0 on shard 0 -> no trade
         self.assertTrue(any("legs $0/" in x for x in logs))

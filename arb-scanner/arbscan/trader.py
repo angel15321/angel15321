@@ -105,6 +105,10 @@ class Config:
     trigger: str = "scan"             # scan (price once per scan) | event (re-check a game on each book change)
     event_gap: float = 0.05           # s: a game is re-checked at most this often on the event path
     confirm_s: float = 0.03           # s: an event-path arb must still be there this long after first sighting
+    stale_pm: str = "skip"            # in-play arb whose STALE leg (leg 1) is Polymarket: skip (PM-first IOCs went 0/38
+                                      # on 11-03: its API takes 85-385 ms, the quote is gone in <100 ms) | first (try it)
+    hedge_max_loss: float = 0.0       # $/contract leg 2 may pay ABOVE break-even to get hedged (0 = break-even only);
+                                      # a bounded locked loss instead of a $20 one-sided hold -- operator's call, off by default
     max_book_age: float = 1.0         # s: an arb priced from an older Kalshi (REST) book is skipped
 
 
@@ -150,8 +154,12 @@ def mid(c: Contract) -> float | None:
     return (c.book.best_bid + c.book.best_ask) / 2
 
 
-def first_leg(opp: engine.Opportunity, cfg: Config, moves: dict[str, float] | None = None) -> str:
-    """'a' or 'b': which leg to buy first (see module docstring)."""
+def first_leg(opp: engine.Opportunity, cfg: Config, moves: dict[str, float] | None = None,
+              changed: set[str] | None = None) -> str:
+    """'a' or 'b': which leg to buy first (see module docstring). `changed` = the venues of THIS pair whose book
+    change triggered the check (event path): the venue that did NOT just move holds the stale quote and goes
+    first. The mid-move fallback cannot tell: both 11-03 held legs (rows 38, 41) had it send Kalshi first while
+    Polymarket's book was the stale one (PM mid-reprice looked like 'PM moved more')."""
     a, b = opp.a, opp.b
     if a.venue == b.venue:
         top = {k: c.book.asks[0][1] if c.book.asks else 0 for k, c in (("a", a), ("b", b))}
@@ -159,6 +167,8 @@ def first_leg(opp: engine.Opportunity, cfg: Config, moves: dict[str, float] | No
     if cfg.leg1 in ("polymarket", "kalshi"):
         want = "Polymarket" if cfg.leg1 == "polymarket" else "Kalshi"
         return "a" if a.venue == want else "b"
+    if changed and len(changed) == 1:
+        return "b" if a.venue in changed else "a"
     live = opp.game.started(dt.datetime.now(dt.timezone.utc))
     ma, mb = (moves or {}).get(a.id), (moves or {}).get(b.id)
     if live and ma is not None and mb is not None and abs(ma - mb) >= 0.005:
@@ -170,21 +180,48 @@ def _top(book, n: int = 3) -> list:
     return [[p, s] for p, s in book.asks[:n]]
 
 
-def book_now(c: Contract) -> dict:
-    """Leg's ask book re-read from the source right now (feed for Polymarket, REST for Kalshi)."""
+def book_now(c: Contract, rest: bool = False) -> dict:
+    """Leg's ask book re-read from the source right now (feed for Polymarket, REST for Kalshi). `rest` adds the
+    Polymarket gateway REST snapshot next to the feed book: no Polymarket IOC has filled yet (0/38), so the
+    feed-book -> order-price mapping is still unconfirmed and the two are logged side by side on every miss."""
     try:
         if c.venue == "Polymarket":
             books = polymarket.fetch_books([c.ref["slug"]]).get(c.ref["slug"])
             book = books and books[0 if c.ref["side"] == "long" else 1]
         else:
-            from . import kalshi
             books = kalshi.fetch_books([c.ref["ticker"]]).get(c.ref["ticker"])
             book = books and books[0 if c.ref["side"] == "yes" else 1]
-        if not book:
-            return {"asks": None}
-        return {"asks": _top(book), "bid": book.best_bid, "age": round(time.time() - book.fetched_at, 3)}
+        out = {"asks": None} if not book else {"asks": _top(book), "bid": book.best_bid,
+                                               "age": round(time.time() - book.fetched_at, 3)}
+        if rest and c.venue == "Polymarket":
+            try:
+                rb = polymarket.fetch_book(c.ref["slug"])[0 if c.ref["side"] == "long" else 1]
+                out["rest"] = {"asks": _top(rb), "bid": rb.best_bid}
+            except Exception as e:
+                out["rest"] = {"error": f"{type(e).__name__}: {e}"}
+        return out
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def live_book(c: Contract):
+    """The leg's book from the in-memory feed right now (no network), or None when no live feed has it."""
+    try:
+        if c.venue == "Polymarket":
+            feed = polymarket._feed
+            hit = feed.get_at(c.ref["slug"]) if feed is not None else None
+            if hit is None:
+                return None
+            long, short = polymarket.books_from(hit[1], now=hit[0])
+            return long if c.ref["side"] == "long" else short
+        feed = kalshi._feed
+        b = feed.get(c.ref["ticker"]) if feed is not None else None
+        if b is None:
+            return None
+        yes, no = kalshi._pair(*b.levels(), time.time())
+        return yes if c.ref["side"] == "yes" else no
+    except Exception:
+        return None
 
 
 def probe_text(p: dict) -> str:
@@ -210,7 +247,8 @@ def _net_held(fills: list[Fill], c: Contract) -> float:
 
 
 def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: float, log=print,
-            moves: dict[str, float] | None = None, leg_budgets: dict[str, float] | None = None) -> dict:
+            moves: dict[str, float] | None = None, leg_budgets: dict[str, float] | None = None,
+            changed: set[str] | None = None) -> dict:
     mode = "live" if cfg.live else "dry"
     detected = time.time()
     lb = leg_budgets or {}     # per-leg cash caps ("a"/"b"): a leg is paid from its own venue / Kalshi shard
@@ -219,7 +257,7 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
         return {}
 
     legs = {"a": (opp.a, plan.fills_a), "b": (opp.b, plan.fills_b)}
-    first = first_leg(opp, cfg, moves)
+    first = first_leg(opp, cfg, moves, changed)
     second = "b" if first == "a" else "a"
     c1, plan1 = legs[first]
     c2, plan2 = legs[second]
@@ -237,7 +275,8 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
     # Probe: what leg 1 was priced from and how long the order took, so a miss can be
     # read as "someone beat us" (quote gone right after) or "never takeable" (still there).
     probe = {"leg1": c1.venue, "limit1": limit1, "book1": _top(c1.book), "book2": _top(c2.book),
-             "age1": round(detected - c1.book.fetched_at, 3), "age2": round(detected - c2.book.fetched_at, 3)}
+             "age1": round(detected - c1.book.fetched_at, 3), "age2": round(detected - c2.book.fetched_at, 3),
+             "changed": sorted(changed) if changed else None}
     # Cross-venue pairs send BOTH legs at once (--legs parallel): leg 2 no longer waits a round trip for
     # leg 1. Each IOC is capped so that both legs filling at their limits still pays off.
     parallel = cfg.legs == "parallel" and c1.venue != c2.venue
@@ -268,7 +307,7 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
             c1, c2, f1, f2, first, second = c2, c1, f2, f1, second, first
     if f1.qty < max(c1.min_size, 0.01):
         if cfg.live:
-            probe["after1"] = book_now(c1)
+            probe["after1"] = book_now(c1, rest=True)
         what = "neither leg filled" if parallel else "leg 1 no fill"
         return _record(db, mode, opp, plan, detected, fills, "missed", 0, 0,
                        note=f"{what}: {f1.error or f1.status} · {probe_text(probe)}", log=log, probe=probe)
@@ -291,29 +330,43 @@ def _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, par
     q1 = f1.qty
     cost1 = (f1.notional + f1.fee) / q1
     # Leg-2 limit: break-even for the cost already paid (minus any required edge).
-    limit2 = max_price_within(opp.guaranteed - cost1 - cfg.leg2_min_edge, c2)
+    limit2 = max_price_within(opp.guaranteed - cost1 - cfg.leg2_min_edge + cfg.hedge_max_loss, c2)
     # Kalshi trades whole contracts; a Polymarket leg 1 may have filled a fraction (min 0.01).
     step = 1.0 if c2.venue == "Kalshi" else 0.01
     min2 = 1.0 if c2.venue == "Kalshi" else max(c2.min_size, 0.01)
     hedged = f2.qty if f2 is not None else 0.0
     remaining = floor_to(q1 - hedged, step)
+    hedge_books, gone = [], ""
     for attempt in range(cfg.hedge_attempts - (1 if parallel else 0)):
         if remaining < min2:
             break
+        if attempt > 0:
+            if "429" in (fills[-1].error or ""):
+                time.sleep(1.0)            # a rate-limited hedge needs a real pause before the retry, or it 429s again
+            # Before a retry look at the feed's in-memory book (no network: this is not the pre-trade REST re-check).
+            # 11-03 rows 38/41: three IOCs at one limit over ~0.8 s into a book that had moved past it; each PM call
+            # is 100-400 ms of extra one-sided exposure. A quote gone at the source ends the retries at once.
+            book = live_book(c2)
+            if book is None:
+                time.sleep(0.3)            # nothing to consult: the old blind pause
+            else:
+                hedge_books.append({"asks": _top(book), "age": round(time.time() - book.fetched_at, 3)})
+                if book.best_ask is None or book.best_ask > limit2 + 1e-9:
+                    gone = f"; hedge quote gone at the source (ask {book.best_ask}), retries stopped"
+                    break
         f2 = brokers[c2.venue].buy(c2, remaining, limit2, notional_hint=remaining * limit2)
         fills.append(f2)
         hedged += f2.qty
         remaining = floor_to(q1 - hedged, step)
         if remaining <= 0:
             break
-        if attempt + 1 < cfg.hedge_attempts:
-            # a rate-limited hedge needs a real pause before the retry, or it 429s again
-            time.sleep(1.0 if "429" in (f2.error or "") else 0.3)
+    if hedge_books:
+        probe["hedge_books"] = hedge_books
 
     residual = q1 - hedged
     qty1_held = q1
     outcome = "hedged" if residual < 0.01 else ("partial" if hedged > 0 else "exposed")
-    note = f"leg1 {q1:g} @ {f1.avg_price:.3f}; leg2 limit {limit2:.3f}, hedged {hedged:g}"
+    note = f"leg1 {q1:g} @ {f1.avg_price:.3f}; leg2 limit {limit2:.3f}, hedged {hedged:g}" + gone
 
     if residual >= 0.01 and cfg.on_fail == "unwind":
         best_bid = c1.book.best_bid or 0
@@ -337,6 +390,9 @@ def _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, par
                 outcome = "unwound" if hedged == 0 else "hedged"
                 if hedged > 0:
                     note += " (partial size, rest unwound)"
+
+    if residual >= 0.01 and cfg.live:
+        probe["after2"] = book_now(c2, rest=True)     # after the decision: the hedge side, feed and REST, for the read
 
     leftover = qty1_held - hedged
     if 0.01 <= leftover < 1.0 and c2.venue == "Kalshi" and hedged > 0 and outcome != "hedged":
@@ -477,7 +533,8 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
     only if it is still there cfg.confirm_s later (a quote moved as delete-then-add looks like a gap for a moment)."""
     mode = "live" if cfg.live else "dry"
     state = {"games": [], "index": {}, "moves": {}, "confirm": {}, "due": {}, "last_eval": {},
-             "stats": {"wakes": 0, "evals": 0, "seen": 0, "blips": 0, "confirmed": 0}, "stats_at": time.time()}
+             "stats": {"wakes": 0, "evals": 0, "seen": 0, "blips": 0, "confirmed": 0, "pm_skipped": 0},
+             "stats_at": time.time()}
     trig = None
     if cfg.trigger == "event":
         trig = Trigger()
@@ -510,7 +567,8 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
                 s = state["stats"]
                 log(f"  event trigger, last {time.time() - state['stats_at']:.0f}s: {s['wakes']:,} wakes · "
                     f"{s['evals']:,} game checks · {s['seen']} arbs seen · {s['blips']} gone within "
-                    f"{cfg.confirm_s * 1000:.0f} ms · {s['confirmed']} confirmed")
+                    f"{cfg.confirm_s * 1000:.0f} ms · {s['confirmed']} confirmed · "
+                    f"{s.get('pm_skipped', 0)} stale-PM skipped")
                 state["stats"] = {k: 0 for k in s}
                 state["stats_at"] = time.time()
         if trig is None:
@@ -550,7 +608,12 @@ def _on_events(db, cfg: Config, brokers: dict, state: dict, keys: set[str], log)
     if not run_now:
         return None
     state["stats"]["evals"] += len(run_now)
-    return _evaluate(db, cfg, brokers, run_now, state["moves"], log, state=state)
+    return _evaluate(db, cfg, brokers, run_now, state["moves"], log, state=state, dirty=keys)
+
+
+def market_key(c: Contract) -> str:
+    """The feed key of a contract's market: Polymarket slug, Kalshi ticker (what on_update reports)."""
+    return c.ref["slug"] if c.venue == "Polymarket" else c.ref["ticker"]
 
 
 _last_mid: dict[str, float] = {}   # contract id -> mid at the previous scan
@@ -570,15 +633,18 @@ def _moves(games) -> dict[str, float]:
     return out
 
 
-_cash: dict = {"at": 0.0, "values": None}
+_cash: dict = {"at": 0.0, "values": None, "dirty": False}
 CASH_TTL = 20.0        # s: Kalshi rate-limits balance reads per account, shared with any other bot on it
 CASH_STALE_OK = 120.0  # s: on a failed read, an older balance still caps the size
 
 
 def balances(brokers: dict, force: bool = False) -> dict[str, float]:
-    """Venue cash, read at most every CASH_TTL seconds (re-read after every trade)."""
+    """Venue cash, read at most every CASH_TTL seconds. After a trade spend() adjusts the cached pots from the
+    fills and marks them dirty: the next call re-reads, but a failed re-read (Kalshi 429) still returns the
+    adjusted copy while it is under CASH_STALE_OK old -- zeroing `at` instead (until 11-03) made that copy
+    unusable and one 429 right after a trade dropped every remaining arb of the evaluation."""
     now = time.time()
-    if not force and _cash["values"] is not None and now - _cash["at"] < CASH_TTL:
+    if not force and not _cash["dirty"] and _cash["values"] is not None and now - _cash["at"] < CASH_TTL:
         return _cash["values"]
     try:
         vals = {v: b.balance() for v, b in brokers.items()}
@@ -586,8 +652,28 @@ def balances(brokers: dict, force: bool = False) -> dict[str, float]:
         if _cash["values"] is not None and now - _cash["at"] < CASH_STALE_OK:
             return _cash["values"]
         raise
-    _cash.update(at=now, values=vals)
+    _cash.update(at=now, values=vals, dirty=False)
     return vals
+
+
+def spend(brokers: dict, opp, fills: list[dict]) -> None:
+    """Debit a trade's fills from the cached venue pots and the Kalshi shard pots, then mark the cache dirty."""
+    vals = _cash["values"]
+    shards = getattr(brokers.get("Kalshi"), "shards", None)
+    legs = {(x.venue, x.label): x for x in (opp.a, opp.b)}
+    for f in fills:
+        q = f.get("qty") or 0
+        if not q:
+            continue
+        cash = -(q * f["avg_price"] + f["fee"]) if f["action"] == "buy" else q * f["avg_price"] - f["fee"]
+        if vals is not None and f["venue"] in vals:
+            vals[f["venue"]] = max(0.0, vals[f["venue"]] + cash)
+        leg = legs.get((f["venue"], f["label"]))
+        if f["venue"] == "Kalshi" and isinstance(shards, dict) and leg is not None and leg.ref.get("shard") is not None:
+            sh = int(leg.ref["shard"])
+            if sh in shards:
+                shards[sh] = max(0.0, shards[sh] + cash)
+    _cash["dirty"] = True
 
 
 def startup_balances(brokers: dict, tries: int = 5, wait: float = 2.0, log=print) -> dict[str, float]:
@@ -621,8 +707,7 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None =
     if state is not None:
         # what the event trigger needs between scans: the games, and which game each market belongs to
         state["games"], state["moves"] = games, moves
-        state["index"] = {c.ref["slug"] if c.venue == "Polymarket" else c.ref["ticker"]: g
-                          for g in games for c in g.contracts}
+        state["index"] = {market_key(c): g for g in games for c in g.contracts}
         live = {g.key for g in games}
         for d in (state["due"], state["last_eval"]):
             for gk in [k for k in d if k not in live]:
@@ -630,9 +715,14 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None =
     return _evaluate(db, cfg, brokers, games, moves, log, scan_errors=snap.errors, state=state)
 
 
-def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=None, state: dict | None = None):
+_skip_said: dict[str, float] = {}   # opp key -> last time its stale-Polymarket skip was logged
+
+
+def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=None, state: dict | None = None,
+              dirty: set[str] | None = None):
     """Price `games` from the live books and trade what qualifies. scan_errors is not None on a full scan
-    (which logs its status line); state is the event trigger's (arbs confirm before trading) or None."""
+    (which logs its status line); state is the event trigger's (arbs confirm before trading) or None;
+    dirty = the market keys whose book change triggered this check (event path), used to pick leg 1."""
     mode = "live" if cfg.live else "dry"
     feed = polymarket._feed
     if feed is not None:
@@ -658,9 +748,24 @@ def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=Non
         log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
             f"{sum(len(g.contracts) for g in games):,} contracts · {len(fresh)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
             + stale_note + feed_note + (" · " + "; ".join(scan_errors) if scan_errors else ""))
+    # which venue of each pair just moved: the OTHER one holds the stale quote and is leg 1 (first_leg)
+    changed_of = {o.key: {x.venue for x in (o.a, o.b) if market_key(x) in dirty} for o in fresh} if dirty else {}
     if state is not None:
-        fresh = _confirmed(cfg, state, games, fresh, t_now)
+        fresh = _confirmed(cfg, state, games, fresh, t_now, changed_of)
+    now_dt = dt.datetime.now(dt.timezone.utc)
     for o in fresh:
+        changed = changed_of.get(o.key) or None
+        leg1 = o.a if first_leg(o, cfg, moves, changed) == "a" else o.b
+        if cfg.stale_pm == "skip" and o.cross_venue and leg1.venue == "Polymarket" and o.game.started(now_dt):
+            # the stale quote is Polymarket's: its API takes 85-385 ms and in-play that quote is gone first
+            # (38/38 PM-first IOCs expired 11-02/03); a miss here would also start the pair's cooldown
+            if state is not None:
+                state["stats"]["pm_skipped"] = state["stats"].get("pm_skipped", 0) + 1
+            if t_now - _skip_said.get(o.key, 0.0) >= 60:
+                _skip_said[o.key] = t_now
+                log(f"  skip {o.game.title}: stale leg is Polymarket ({leg1.label}; moved: "
+                    f"{', '.join(sorted(changed)) if changed else 'unknown'}), PM-first does not fill in-play")
+            continue
         if recently_taken(db, o.key, cfg.cooldown_min):
             continue
         room_day = cfg.max_daily_spend - spent_today(db, mode)
@@ -688,34 +793,39 @@ def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=Non
                 + (f", legs ${pots['a']:.0f}/${pots['b']:.0f}" if cross else "") + ")")
             continue
         try:
-            done = execute(db, o, brokers, cfg, budget, log, moves=moves, leg_budgets=leg_budgets)
+            done = execute(db, o, brokers, cfg, budget, log, moves=moves, leg_budgets=leg_budgets, changed=changed)
         except Exception as e:
             done = True
             log(f"! execution error on {o.game.title}: {type(e).__name__}: {e}")
         if done:
-            _cash["at"] = 0.0          # cash changed (or may have): re-read before the next trade
+            # debit the cached pots from the fills and re-read at the next call; a 429 then falls back to them
+            spend(brokers, o, json.loads(done["fills"]) if isinstance(done, dict) and done.get("fills") else [])
         if recent_failures(db, mode, cfg.max_failures) >= cfg.max_failures:
             return "halt"
     return None
 
 
-def _confirmed(cfg: Config, state: dict, games, fresh, now: float) -> list:
+def _confirmed(cfg: Config, state: dict, games, fresh, now: float, changed_of: dict | None = None) -> list:
     """Arbs seen for at least cfg.confirm_s on the event path. A first sighting is parked and its game
-    re-checked when the confirm time is up; an arb that is gone at that look was a blip."""
+    re-checked when the confirm time is up; an arb that is gone at that look was a blip. The venues that
+    moved at the FIRST sighting (what created the arb) are kept and handed back in `changed_of` on confirm."""
     confirm, out = state["confirm"], []
+    changed_of = changed_of if changed_of is not None else {}
     here = {o.key for o in fresh}
     checked = {g.key for g in games}
-    for k in [k for k, (_, gk) in confirm.items() if gk in checked and k not in here]:
+    for k in [k for k, v in confirm.items() if v[1] in checked and k not in here]:
         confirm.pop(k)                                   # parked arb of a re-checked game that vanished
         state["stats"]["blips"] += 1
     for o in fresh:
         first = confirm.get(o.key)
         if first is None:
-            confirm[o.key] = (now, o.game.key)
+            confirm[o.key] = (now, o.game.key, set(changed_of.get(o.key) or ()))
             state["stats"]["seen"] += 1
             state["due"][o.game.key] = min(state["due"].get(o.game.key, float("inf")), now + cfg.confirm_s)
         elif now - first[0] >= cfg.confirm_s:
             confirm.pop(o.key)
             state["stats"]["confirmed"] += 1
+            if len(first) > 2 and first[2]:
+                changed_of[o.key] = first[2]
             out.append(o)
     return out
