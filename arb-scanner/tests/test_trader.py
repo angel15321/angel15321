@@ -238,6 +238,23 @@ class BalanceCacheTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             trader.balances(self.b)
 
+    def test_startup_waits_out_a_429(self):
+        self.k.balance.side_effect = [RuntimeError("Kalshi GET /portfolio/balance → HTTP 429"), 25.0]
+        with mock.patch.object(trader.time, "sleep") as sl:
+            self.assertEqual(trader.startup_balances(self.b, log=lambda *_: None)["Kalshi"], 25.0)
+        sl.assert_called_once_with(2.0)
+        self.assertEqual(trader._cash["values"]["Kalshi"], 25.0)    # seeds the cache for the first scan
+
+    def test_startup_raises_other_errors_and_gives_up(self):
+        self.k.balance.side_effect = RuntimeError("HTTP 401 unauthorized")
+        with mock.patch.object(trader.time, "sleep") as sl, self.assertRaises(RuntimeError):
+            trader.startup_balances(self.b, log=lambda *_: None)
+        sl.assert_not_called()
+        self.k.balance.side_effect = RuntimeError("HTTP 429")
+        with mock.patch.object(trader.time, "sleep") as sl, self.assertRaises(RuntimeError):
+            trader.startup_balances(self.b, tries=3, log=lambda *_: None)
+        self.assertEqual(sl.call_count, 2)
+
 
 class KalshiBrokerTests(unittest.TestCase):
     def setUp(self):

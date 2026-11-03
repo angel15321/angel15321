@@ -54,7 +54,7 @@ def cmd_run(a):
         sys.exit(f"Cannot start live trading: {e}")
     db = trader.connect(a.db)
     if cfg.live:
-        bal = {v: b.balance() for v, b in brokers.items()}
+        bal = trader.startup_balances(brokers, log=log)
         log("=" * 72)
         log("LIVE TRADING — real orders will be placed.")
         log(f"Balances: Kalshi ${bal['Kalshi']:,.2f} · Polymarket US ${bal['Polymarket']:,.2f}")

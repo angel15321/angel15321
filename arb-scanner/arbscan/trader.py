@@ -416,6 +416,19 @@ def balances(brokers: dict, force: bool = False) -> dict[str, float]:
     return vals
 
 
+def startup_balances(brokers: dict, tries: int = 5, wait: float = 2.0, log=print) -> dict[str, float]:
+    """First balance read. A 429 here (e.g. right after `check` read the same account) is waited out
+    with growing pauses instead of crashing the start; any other error is raised at once."""
+    for i in range(tries):
+        try:
+            return balances(brokers, force=True)
+        except Exception as e:
+            if "429" not in str(e) or i == tries - 1:
+                raise
+            log(f"balance read rate-limited (429), retrying in {wait * (i + 1):.0f} s")
+            time.sleep(wait * (i + 1))
+
+
 def _tick(db, cfg: Config, brokers: dict, days: float, log):
     mode = "live" if cfg.live else "dry"
     # In-play scans only fetch games starting within 30 min (Kalshi kickoffs are
