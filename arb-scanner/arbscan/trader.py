@@ -31,7 +31,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from . import engine, polymarket, scanner
+from . import engine, kalshi, polymarket, scanner
 from .brokers import Fill, floor_to, max_price_within
 from .model import Contract
 
@@ -496,6 +496,9 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
         # fetch then takes 1-3 s (11-03: every miss was priced from a 1.3-3.6 s old Polymarket book).
         # Re-read them from the feed now: memory only, no network.
         polymarket.refresh([c for g in games for c in g.contracts if c.venue == "Polymarket"])
+    if kalshi._feed is not None and kalshi._feed.alive():
+        # same for Kalshi when its books are live (otherwise they are this scan's REST reads)
+        kalshi.refresh([c for g in games for c in g.contracts if c.venue == "Kalshi"])
     arbs, _ = engine.find(games, min_roi=cfg.min_roi, cross_venue_only=cfg.cross_venue_only)
     arbs = [o for o in engine.non_overlapping(arbs) if o.max.profit >= cfg.min_profit]
     # Kalshi books are REST snapshots: their age IS how stale they are. A Polymarket book is the feed's latest

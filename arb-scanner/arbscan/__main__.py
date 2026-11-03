@@ -14,7 +14,7 @@ import datetime as dt
 import json
 import sys
 
-from . import engine, fees, pmws, polymarket, report, scanner, trader
+from . import engine, fees, kalshi, kalshiws, pmws, polymarket, report, scanner, trader
 
 
 def _log_to(path: str | None):
@@ -37,6 +37,16 @@ def _attach_feed(log=print) -> bool:
         return False
     polymarket.use_feed(feed)
     log("Polymarket books: live websocket")
+    try:
+        kfeed = kalshiws.BookFeed.from_env()
+    except Exception as e:  # a bad key path must not stop the Polymarket side
+        kfeed = None
+        log(f"Kalshi websocket not started: {type(e).__name__}: {e}")
+    if kfeed is None:
+        log("Kalshi books: REST each scan (set KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH for live websocket books)")
+    else:
+        kalshi.use_feed(kfeed)
+        log("Kalshi books: live websocket (REST only for a market's first read)")
     return True
 
 

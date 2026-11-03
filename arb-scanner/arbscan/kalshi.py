@@ -80,21 +80,45 @@ def _markets_now(series: str) -> list[dict]:
             return out
 
 
+_feed = None             # kalshiws.BookFeed when live books are available (see use_feed)
+
+
+def use_feed(feed) -> None:
+    """Read books from the live websocket feed; REST is used only for markets it has no book for yet."""
+    global _feed
+    _feed = feed
+
+
+def _pair(yes_bids: list[tuple[float, float]], no_bids: list[tuple[float, float]], at: float) -> tuple[Book, Book]:
+    yes = Book(asks=[(round(1 - p, 4), s) for p, s in no_bids], bids=yes_bids, fetched_at=at)
+    no = Book(asks=[(round(1 - p, 4), s) for p, s in yes_bids], bids=no_bids, fetched_at=at)
+    return yes, no
+
+
 def fetch_books(tickers: list[str]) -> dict[str, tuple[Book, Book]]:
     """ticker -> (YES book, NO book). Kalshi returns bids only; a YES ask at
     p is a NO bid at 1-p and vice versa."""
     out: dict[str, tuple[Book, Book]] = {}
-    for i in range(0, len(tickers), 100):
-        chunk = tickers[i:i + 100]
+    rest = list(tickers)
+    if _feed is not None:
+        _feed.want(tickers)
+    if _feed is not None and _feed.alive():
+        now, rest = time.time(), []
+        for t in tickers:
+            b = _feed.get(t)
+            if b is None:
+                rest.append(t)                    # just subscribed / resyncing: one REST read this scan
+            else:
+                out[t] = _pair(*b.levels(), now)  # a live book is current as of this read
+    for i in range(0, len(rest), 100):
+        chunk = rest[i:i + 100]
         data = http.get(f"{API}/markets/orderbooks", {"tickers": chunk})
         now = time.time()
         for ob in data.get("orderbooks", []):
             o = ob.get("orderbook_fp") or {}
             yes_bids = sorted(((float(p), float(s)) for p, s in o.get("yes_dollars") or []), reverse=True)
             no_bids = sorted(((float(p), float(s)) for p, s in o.get("no_dollars") or []), reverse=True)
-            yes = Book(asks=[(round(1 - p, 4), s) for p, s in no_bids], bids=yes_bids, fetched_at=now)
-            no = Book(asks=[(round(1 - p, 4), s) for p, s in yes_bids], bids=no_bids, fetched_at=now)
-            out[ob["ticker"]] = (yes, no)
+            out[ob["ticker"]] = _pair(yes_bids, no_bids, now)
     return out
 
 
