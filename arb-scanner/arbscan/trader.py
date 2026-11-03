@@ -178,7 +178,7 @@ def book_now(c: Contract) -> dict:
             book = books and books[0 if c.ref["side"] == "yes" else 1]
         if not book:
             return {"asks": None}
-        return {"asks": _top(book), "age": round(time.time() - book.fetched_at, 3)}
+        return {"asks": _top(book), "bid": book.best_bid, "age": round(time.time() - book.fetched_at, 3)}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -200,11 +200,17 @@ def recently_taken(db, key: str, minutes: float) -> bool:
 
 # ---------------------------------------------------------------- execution
 
+def _net_held(fills: list[Fill], c: Contract) -> float:
+    """Contracts of `c` held after these fills (buys minus sells)."""
+    return sum(f.qty if f.action == "buy" else -f.qty for f in fills if f.venue == c.venue and f.label == c.label)
+
+
 def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: float, log=print,
-            moves: dict[str, float] | None = None) -> dict:
+            moves: dict[str, float] | None = None, leg_budgets: dict[str, float] | None = None) -> dict:
     mode = "live" if cfg.live else "dry"
     detected = time.time()
-    plan = engine.size(opp.a, opp.b, opp.guaranteed, max_outlay=budget)
+    lb = leg_budgets or {}     # per-leg cash caps ("a"/"b"): a leg is paid from its own venue / Kalshi shard
+    plan = engine.size(opp.a, opp.b, opp.guaranteed, max_outlay=budget, max_outlay_a=lb.get("a"), max_outlay_b=lb.get("b"))
     if plan.qty <= 0 or plan.profit < cfg.min_profit:
         return {}
 
@@ -263,15 +269,32 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
         return _record(db, mode, opp, plan, detected, fills, "missed", 0, 0,
                        note=f"{what}: {f1.error or f1.status} · {probe_text(probe)}", log=log, probe=probe)
 
+    try:
+        return _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, parallel, brokers, cfg, log, probe)
+    except Exception as e:
+        # Leg 1 is a real position: record it from the fills so far before the error leaves execute, so
+        # settle(), the open-exposure cap, the cooldown and the halt streak all see it.
+        held1, held2 = _net_held(fills, c1), _net_held(fills, c2)
+        q_a, q_b = (held1, held2) if first == "a" else (held2, held1)
+        _record(db, mode, opp, plan, detected, fills, "error", q_a, q_b,
+                note=f"{type(e).__name__}: {e} -- position recorded from the fills so far; verify on the venues",
+                log=log, probe=probe)
+        raise
+
+
+def _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, parallel, brokers, cfg, log, probe) -> dict:
+    """Hedge leg 1, unwind or hold what cannot be hedged, record the row."""
     q1 = f1.qty
     cost1 = (f1.notional + f1.fee) / q1
     # Leg-2 limit: break-even for the cost already paid (minus any required edge).
     limit2 = max_price_within(opp.guaranteed - cost1 - cfg.leg2_min_edge, c2)
-    step = 0.01 if c2.venue == "Kalshi" else 0.01
+    # Kalshi trades whole contracts; a Polymarket leg 1 may have filled a fraction (min 0.01).
+    step = 1.0 if c2.venue == "Kalshi" else 0.01
+    min2 = 1.0 if c2.venue == "Kalshi" else max(c2.min_size, 0.01)
     hedged = f2.qty if f2 is not None else 0.0
     remaining = floor_to(q1 - hedged, step)
     for attempt in range(cfg.hedge_attempts - (1 if parallel else 0)):
-        if remaining < max(c2.min_size if c2.venue == "Polymarket" else 0.01, 0.01):
+        if remaining < min2:
             break
         f2 = brokers[c2.venue].buy(c2, remaining, limit2, notional_hint=remaining * limit2)
         fills.append(f2)
@@ -290,6 +313,12 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
 
     if residual >= 0.01 and cfg.on_fail == "unwind":
         best_bid = c1.book.best_bid or 0
+        if cfg.live:
+            # the scan-time bid is 1-2 s old after the fill and the hedge tries: decide on the live one
+            now1 = book_now(c1)
+            if now1.get("bid") is not None:
+                note += f"; bid {best_bid:.3f} at scan, {now1['bid']:.3f} now"
+                best_bid = now1["bid"]
         # Selling at or above (price paid - unwind_max_loss) loses at most the fees plus that allowance.
         # Below it the sale would cost more than the operator accepts, so the leg is held to settlement.
         floor = f1.avg_price - cfg.unwind_max_loss
@@ -304,6 +333,12 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
                 outcome = "unwound" if hedged == 0 else "hedged"
                 if hedged > 0:
                     note += " (partial size, rest unwound)"
+
+    leftover = qty1_held - hedged
+    if 0.01 <= leftover < 1.0 and c2.venue == "Kalshi" and hedged > 0 and outcome != "hedged":
+        # the fraction under one Kalshi contract can never be hedged there: dust, not a failed hedge
+        outcome = "hedged"
+        note += f"; {leftover:g} ct dust (under one Kalshi contract) held"
 
     q_a, q_b = (qty1_held, hedged) if first == "a" else (hedged, qty1_held)
     return _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note=note, log=log, probe=probe)
@@ -338,11 +373,22 @@ def _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note="", lo
 
 # ---------------------------------------------------------------- settlement
 
-def settle(db, log=print) -> int:
+SETTLE_GAP = 60.0      # s between exchange settlement reads from the trading loop (`status` reads at once)
+_settled_at = 0.0
+
+
+def settle(db, log=print, min_gap: float = 0.0) -> int:
+    """Price open rows from each venue's official result. No fixed 'kickoff + N h' wait: NBA games end
+    in ~2h15m and tennis start times are schedule slots, so the exchange's own status decides; only
+    rows whose game has not started yet are skipped. `min_gap` paces the reads from the 1-s loop."""
+    global _settled_at
+    if min_gap and time.time() - _settled_at < min_gap:
+        return 0
+    _settled_at = time.time()
     now = dt.datetime.now(dt.timezone.utc)
     n = 0
     for r in db.execute("SELECT * FROM trades WHERE status='open'").fetchall():
-        if r["kickoff"] and dt.datetime.fromisoformat(r["kickoff"]) > now - dt.timedelta(hours=3):
+        if r["kickoff"] and dt.datetime.fromisoformat(r["kickoff"]) > now:
             continue
         payout, ok = 0.0, True
         for leg, q in (("leg_a", r["qty_a"]), ("leg_b", r["qty_b"])):
@@ -407,6 +453,10 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
         if os.path.exists(cfg.kill_file):
             log(f"Kill switch: '{cfg.kill_file}' exists — stopping.")
             return
+        try:
+            settle(db, log, min_gap=SETTLE_GAP)     # before the halt check: held positions settle while halted
+        except Exception as e:
+            log(f"! settle error: {e}")
         streak = recent_failures(db, mode, cfg.max_failures)
         if streak >= cfg.max_failures:
             log(f"Halting: last {streak} trades failed to hedge. Review the log, then run again.")
@@ -416,10 +466,6 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
             _tick(db, cfg, brokers, days, log)
         except Exception as e:  # keep the bot alive across transient API errors
             log(f"! scan error: {type(e).__name__}: {e}")
-        try:
-            settle(db, log)
-        except Exception as e:
-            log(f"! settle error: {e}")
         if once:
             return
         time.sleep(max(1.0, interval - (time.time() - t0)))
@@ -523,22 +569,25 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
         except Exception as e:
             log(f"! balance check failed: {e}")
             return
-        # Each leg is paid on its own venue -- a Kalshi leg from its market's shard -- and the smaller
-        # pot caps the pair.
+        # Each leg is paid from its own pot -- a Kalshi leg from its market's shard -- and legs are rarely
+        # equal halves of the pair (0.85 + 0.12), so each pot caps ITS leg's outlay, not just the pair's.
         shards = getattr(brokers.get("Kalshi"), "shards", None)
-        pots = []
-        for leg in {o.a.venue: o.a, o.b.venue: o.b}.values():
+        pots = {}
+        for k, leg in (("a", o.a), ("b", o.b)):
             pot = cash[leg.venue]
             if leg.venue == "Kalshi" and shards is not None and leg.ref.get("shard") is not None:
                 pot = shards.get(int(leg.ref["shard"]), 0.0)
-            pots.append(pot)
-        cash_cap = min(pots) * (2 if len(pots) == 2 else 1) * 0.95
+            pots[k] = pot * 0.95
+        cross = o.a.venue != o.b.venue
+        cash_cap = sum(pots.values()) if cross else min(pots.values())
+        leg_budgets = pots if cross else None
         budget = min(cfg.max_per_trade, room_day, room_open, cash_cap)
-        if budget < 5:
-            log(f"  skip {o.game.title}: limit reached (day ${room_day:.0f}, open ${room_open:.0f}, cash ${cash_cap:.0f})")
+        if budget < 5 or (cross and min(pots.values()) < 1):
+            log(f"  skip {o.game.title}: limit reached (day ${room_day:.0f}, open ${room_open:.0f}, cash ${cash_cap:.0f}"
+                + (f", legs ${pots['a']:.0f}/${pots['b']:.0f}" if cross else "") + ")")
             continue
         try:
-            done = execute(db, o, brokers, cfg, budget, log, moves=moves)
+            done = execute(db, o, brokers, cfg, budget, log, moves=moves, leg_budgets=leg_budgets)
         except Exception as e:
             done = True
             log(f"! execution error on {o.game.title}: {type(e).__name__}: {e}")

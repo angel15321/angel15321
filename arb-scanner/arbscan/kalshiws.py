@@ -34,22 +34,28 @@ URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 SIGN_PATH = "/trade-api/ws/v2"
 DEAD_AFTER = 10.0        # seconds without an in-order book frame -> books presumed stale
 LAG_MAX = 2.0            # seconds a delta may trail the exchange clock before the feed is rebuilt
+LAG_GRACE = 5.0          # seconds after (re)connect during which lag is not judged: the snapshot burst queues deltas
+LAG_FRAMES = 20          # consecutive lagging deltas before a rebuild (one late frame is not a dead feed)
+IDLE_EVICT = 3600.0      # seconds a ticker may go unrequested before it leaves wanted/books (settled games)
 DEAD_SUB_CODES = (7, 25)
 
 
 class Book:
-    __slots__ = ("yes", "no", "valid", "updated")
+    __slots__ = ("yes", "no", "valid", "updated", "lock")
 
     def __init__(self):
         self.yes: dict[str, float] = {}     # price string -> size (resting YES bids)
         self.no: dict[str, float] = {}      # resting NO bids
         self.valid = False
         self.updated = 0.0
+        self.lock = threading.Lock()        # the websocket thread writes, the scanner thread reads levels()
 
     def snapshot(self, msg: dict) -> None:
-        self.yes = {p: float(s) for p, s in msg.get("yes_dollars_fp") or [] if float(s) > 0}
-        self.no = {p: float(s) for p, s in msg.get("no_dollars_fp") or [] if float(s) > 0}
-        self.valid, self.updated = True, time.time()
+        yes = {p: float(s) for p, s in msg.get("yes_dollars_fp") or [] if float(s) > 0}
+        no = {p: float(s) for p, s in msg.get("no_dollars_fp") or [] if float(s) > 0}
+        with self.lock:
+            self.yes, self.no = yes, no
+            self.valid, self.updated = True, time.time()
 
     def delta(self, msg: dict) -> None:
         side = self.yes if msg.get("side") == "yes" else self.no if msg.get("side") == "no" else None
@@ -57,19 +63,23 @@ class Book:
             return
         p = msg.get("price_dollars")
         try:
-            size = round(side.get(p, 0.0) + float(msg.get("delta_fp")), 2)   # 2-dp sizes: quantize the residue away
+            d = float(msg.get("delta_fp"))
         except (TypeError, ValueError):
             return
-        if size >= 0.005:
-            side[p] = size
-        else:
-            side.pop(p, None)
-        self.updated = time.time()
+        with self.lock:
+            size = round(side.get(p, 0.0) + d, 2)   # 2-dp sizes: quantize the residue away
+            if size >= 0.005:
+                side[p] = size
+            else:
+                side.pop(p, None)
+            self.updated = time.time()
 
     def levels(self) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
         """(YES bids, NO bids) best first, as (price, size)."""
-        return (sorted(((float(p), s) for p, s in self.yes.items()), reverse=True),
-                sorted(((float(p), s) for p, s in self.no.items()), reverse=True))
+        with self.lock:
+            yes, no = list(self.yes.items()), list(self.no.items())
+        return (sorted(((float(p), s) for p, s in yes), reverse=True),
+                sorted(((float(p), s) for p, s in no), reverse=True))
 
 
 class BookFeed:
@@ -77,6 +87,9 @@ class BookFeed:
         self.key_id, self.key, self.url = key_id, private_key, url
         self.books: dict[str, Book] = {}
         self.wanted: set[str] = set()
+        self._asked: dict[str, float] = {}      # ticker -> last want() time, for eviction
+        self._evicted_at = time.time()
+        self._last_resync, self._resync_gap = 0.0, 1.0
         self._lock = threading.Lock()
         self._reset_session()
         self.connected = False
@@ -94,6 +107,9 @@ class BookFeed:
         self._sent: set[str] = set()       # tickers on the subscription (or in the initial subscribe)
         self._next_id = 1
         self._resync = False
+        self._grow_needed = False          # set by want() / a deferred _grow; checked O(1) per frame
+        self._lag_run = 0                  # consecutive deltas behind the exchange clock
+        self.connected_at = 0.0
 
     @classmethod
     def from_env(cls) -> "BookFeed | None":
@@ -113,11 +129,25 @@ class BookFeed:
     # ------------------------------------------------------------ public
 
     def want(self, tickers) -> set[str]:
-        new = set(tickers) - self.wanted
-        if not new:
-            return new
+        now = time.time()
+        tickers = set(tickers)
+        for t in tickers:
+            self._asked[t] = now
+        new = tickers - self.wanted
         with self._lock:
             self.wanted |= new
+            if now - self._evicted_at > IDLE_EVICT:
+                # tickers nobody asked for in an hour (settled games) leave, so a reconnect does not
+                # re-subscribe every market ever seen and the book dict stays bounded
+                self._evicted_at = now
+                idle = {t for t in self.wanted if now - self._asked.get(t, 0.0) > IDLE_EVICT}
+                self.wanted -= idle
+                for t in idle:
+                    self.books.pop(t, None)
+                    self._asked.pop(t, None)
+        if not new:
+            return new
+        self._grow_needed = True
         if self._loop and self.connected:
             asyncio.run_coroutine_threadsafe(self._grow(), self._loop)
         return new
@@ -171,16 +201,19 @@ class BookFeed:
                         self._reset_session()
                         self._invalidate_all()
                         self._ws, self.connected = ws, True
-                    self.last_msg = time.time()
+                    self.last_msg = self.connected_at = time.time()
                     await self._grow()
                     while not self._resync:
                         raw = await asyncio.wait_for(ws.recv(), timeout=DEAD_AFTER * 3)
                         self.last_msg = time.time()
                         self._handle(raw)
-                        if self.wanted - self._sent and self.sid is not None:
+                        if self._grow_needed and self.sid is not None:
                             await self._grow()
                     self.resyncs += 1
                     backoff = 1.0             # a resync is a deliberate rebuild, not a failure
+                    now = time.time()         # ...but rebuilds that chase each other back off (a rebuild adds lag)
+                    self._resync_gap = min(self._resync_gap * 2, 30.0) if now - self._last_resync < 60 else 1.0
+                    self._last_resync = now
             except Exception as e:  # network, auth hiccup, server close: reconnect and re-subscribe everything
                 self.error = f"{type(e).__name__}: {e}"[:200]
                 backoff = min(backoff * 2, 30.0)
@@ -188,7 +221,7 @@ class BookFeed:
                 self.connected, self._ws = False, None
                 self._invalidate_all()
             self.reconnects += 1
-            await asyncio.sleep(min(backoff, 1.0) if self._resync else backoff)
+            await asyncio.sleep(self._resync_gap if self._resync else backoff)
 
     async def _grow(self) -> None:
         """Initial subscribe once; afterwards add new markets to the same subscription."""
@@ -197,8 +230,13 @@ class BookFeed:
             return
         with self._lock:
             todo = sorted(self.wanted - self._sent)
-            if not todo or (self._sent and self.sid is None):
-                return                         # nothing new, or the initial subscribe is not acked yet
+            if not todo:
+                self._grow_needed = False
+                return                         # nothing new
+            if self._sent and self.sid is None:
+                self._grow_needed = True       # the initial subscribe is not acked yet: retry after the ack
+                return
+            self._grow_needed = False
             self._sent |= set(todo)
             cid = self._next_id
             self._next_id += 1
@@ -246,8 +284,15 @@ class BookFeed:
             if b is not None and b.valid:
                 b.delta(msg)
             ts = msg.get("ts_ms")
-            if ts and time.time() - ts / 1000 > LAG_MAX:
-                self.error = f"deltas {time.time() - ts / 1000:.1f}s behind the exchange"
-                self._resync = True
-                return
+            lag = time.time() - ts / 1000 if ts else 0.0
+            if lag > LAG_MAX and time.time() - self.connected_at > LAG_GRACE:
+                # judged only after the post-connect snapshot burst, and only when it persists: one late
+                # frame, or the queue a rebuild itself creates, must not trigger the next rebuild
+                self._lag_run += 1
+                if self._lag_run >= LAG_FRAMES:
+                    self.error = f"deltas {lag:.1f}s behind the exchange"
+                    self._resync = True
+                    return
+            else:
+                self._lag_run = 0
         self.last_book = time.time()

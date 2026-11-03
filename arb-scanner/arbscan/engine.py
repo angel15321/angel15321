@@ -94,28 +94,38 @@ def guaranteed_payout(a: Contract, b: Contract) -> tuple[float, tuple[int, int] 
 
 
 def _walk(a: Contract, b: Contract, guaranteed: float, max_outlay: float | None,
-          max_qty: float | None, min_edge: float):
-    """Greedy level-by-level walk. Returns (qty, curve)."""
+          max_qty: float | None, min_edge: float,
+          max_outlay_a: float | None = None, max_outlay_b: float | None = None):
+    """Greedy level-by-level walk. Returns (qty, curve). `max_outlay_a/b` cap each leg's own
+    outlay (its venue's or shard's cash): legs are rarely equal halves of the pair."""
     asks_a, asks_b = list(a.book.asks), list(b.book.asks)
     ia = ib = 0
     ra = asks_a[0][1] if asks_a else 0
     rb = asks_b[0][1] if asks_b else 0
     qty = spent = profit = 0.0
+    spent_a = spent_b = 0.0
     curve = []
     while ia < len(asks_a) and ib < len(asks_b):
         pa, pb = asks_a[ia][0], asks_b[ib][0]
-        unit = pa + a.fee.per_contract(pa) + pb + b.fee.per_contract(pb)
+        unit_a, unit_b = pa + a.fee.per_contract(pa), pb + b.fee.per_contract(pb)
+        unit = unit_a + unit_b
         if unit >= guaranteed - min_edge:
             break
         dq = min(ra, rb)
         if max_outlay is not None:
             dq = min(dq, max(0.0, (max_outlay - spent) / unit))
+        if max_outlay_a is not None:
+            dq = min(dq, max(0.0, (max_outlay_a - spent_a) / unit_a))
+        if max_outlay_b is not None:
+            dq = min(dq, max(0.0, (max_outlay_b - spent_b) / unit_b))
         if max_qty is not None:
             dq = min(dq, max_qty - qty)
         if dq <= 1e-9:
             break
         qty += dq
         spent += dq * unit
+        spent_a += dq * unit_a
+        spent_b += dq * unit_b
         profit += dq * (guaranteed - unit)
         curve.append((qty, spent, profit))
         ra -= dq
@@ -141,10 +151,12 @@ def _fills(asks: list[tuple[float, float]], qty: float) -> list[tuple[float, flo
 
 
 def size(a: Contract, b: Contract, guaranteed: float, max_outlay: float | None = None,
-         max_qty: float | None = None, min_edge: float = 0.0) -> Sizing:
+         max_qty: float | None = None, min_edge: float = 0.0,
+         max_outlay_a: float | None = None, max_outlay_b: float | None = None) -> Sizing:
     """Largest whole-contract size where every pair is profitable, with exact
-    venue fees and rounding applied to the final orders."""
-    raw, _ = _walk(a, b, guaranteed, max_outlay, max_qty, min_edge)
+    venue fees and rounding applied to the final orders. `max_outlay_a/b` cap
+    each leg's own outlay (the cash on its venue / Kalshi shard)."""
+    raw, _ = _walk(a, b, guaranteed, max_outlay, max_qty, min_edge, max_outlay_a, max_outlay_b)
     qty = math.floor(raw + 1e-9)
     min_q = max(a.min_size, b.min_size)
     while qty >= min_q:
@@ -152,7 +164,9 @@ def size(a: Contract, b: Contract, guaranteed: float, max_outlay: float | None =
         na, fee_a = a.fee.order_total(fa)
         nb, fee_b = b.fee.order_total(fb)
         s = Sizing(qty, fa, fb, na + nb, fee_a + fee_b, qty * guaranteed)
-        if (max_outlay is None or s.outlay <= max_outlay + 1e-9) and s.profit > 0:
+        if ((max_outlay is None or s.outlay <= max_outlay + 1e-9)
+                and (max_outlay_a is None or na + fee_a <= max_outlay_a + 1e-9)
+                and (max_outlay_b is None or nb + fee_b <= max_outlay_b + 1e-9) and s.profit > 0):
             return s
         # Order-level rounding (Kalshi rounds outlay up to the cent) can tip a
         # tiny order negative; shrink and retry.

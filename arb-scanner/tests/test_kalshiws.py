@@ -19,6 +19,7 @@ def feed():
     """A BookFeed without its network thread."""
     f = object.__new__(kalshiws.BookFeed)
     f.books, f.wanted, f._lock, f._loop, f._ws = {}, set(), threading.Lock(), None, None
+    f._asked, f._evicted_at, f._last_resync, f._resync_gap = {}, time.time(), 0.0, 1.0
     f._reset_session()
     f.connected, f.last_msg, f.last_book, f.reconnects, f.gaps, f.resyncs, f.error = True, time.time(), 0.0, 0, 0, 0, ""
     f.sid = 1
@@ -71,11 +72,57 @@ class BookTests(unittest.TestCase):
         self.assertIsNone(f.get("A"))
 
     def test_lagging_deltas_rebuild(self):
+        late = dict(market_ticker="A", price_dollars="0.4000", delta_fp="1.00", side="yes",
+                    ts_ms=int((time.time() - 5) * 1000))
         f = feed()
         f._handle(frame("orderbook_snapshot", 1, 1, market_ticker="A", yes_dollars_fp=[["0.4000", "1.00"]]))
-        f._handle(frame("orderbook_delta", 1, 2, market_ticker="A", price_dollars="0.4000", delta_fp="1.00",
-                        side="yes", ts_ms=int((time.time() - 5) * 1000)))
-        self.assertIsNone(f.get("A"))
+        for i in range(kalshiws.LAG_FRAMES - 1):
+            f._handle(frame("orderbook_delta", 1, 2 + i, **late))
+        self.assertIsNotNone(f.get("A"))                # a few late frames are not a dead feed
+        f._handle(frame("orderbook_delta", 1, 1 + kalshiws.LAG_FRAMES, **late))
+        self.assertIsNone(f.get("A"))                   # ...a persistent lag is
+        f = feed()
+        f.connected_at = time.time()                    # right after a (re)connect the snapshot burst queues deltas
+        f._handle(frame("orderbook_snapshot", 1, 1, market_ticker="A", yes_dollars_fp=[["0.4000", "1.00"]]))
+        for i in range(kalshiws.LAG_FRAMES + 5):
+            f._handle(frame("orderbook_delta", 1, 2 + i, **late))
+        self.assertIsNotNone(f.get("A"))                # lag is not judged inside the grace period
+
+    def test_levels_safe_while_deltas_land(self):
+        f = feed()
+        f._handle(frame("orderbook_snapshot", 1, 1, market_ticker="A",
+                        yes_dollars_fp=[[f"0.{i:02d}00", "1.00"] for i in range(1, 60)]))
+        stop, errors = threading.Event(), []
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    f.get("A").levels()
+            except Exception as e:  # pragma: no cover - the race this test guards against
+                errors.append(e)
+        t = threading.Thread(target=reader)
+        t.start()
+        seq = 2
+        for _ in range(300):
+            for i in range(60, 80):
+                f._handle(frame("orderbook_delta", 1, seq, market_ticker="A", price_dollars=f"0.{i}00", delta_fp="1.00", side="yes"))
+                seq += 1
+            for i in range(60, 80):
+                f._handle(frame("orderbook_delta", 1, seq, market_ticker="A", price_dollars=f"0.{i}00", delta_fp="-1.00", side="yes"))
+                seq += 1
+        stop.set()
+        t.join()
+        self.assertEqual(errors, [])
+
+    def test_idle_tickers_evicted_on_want(self):
+        f = feed()
+        f.want({"OLD", "KEEP"})
+        f._handle(frame("orderbook_snapshot", 1, 1, market_ticker="OLD", yes_dollars_fp=[["0.4000", "1.00"]]))
+        f._asked["OLD"] -= kalshiws.IDLE_EVICT + 1
+        f._evicted_at -= kalshiws.IDLE_EVICT + 1
+        f.want({"KEEP"})
+        self.assertEqual(f.wanted, {"KEEP"})
+        self.assertNotIn("OLD", f.books)
 
     def test_subscribe_once_then_grow_in_place(self):
         f = feed()

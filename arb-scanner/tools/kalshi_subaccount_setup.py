@@ -196,8 +196,8 @@ def main():
     ap.add_argument("--name", default="arbscan-laptop")
     ap.add_argument("--out", default=os.path.expanduser("~/arbscan-kalshi.pem"))
     ap.add_argument("--env-out", default=os.path.expanduser("~/arbscan-kalshi.env"))
-    ap.add_argument("--laptop-pem", default=r"C:\Users\ad528\.secrets\kalshi-arb.pem",
-                    help="where the .pem will live on the machine running the bot")
+    ap.add_argument("--laptop-pem", default="~/.secrets/kalshi-arb.pem",
+                    help="where the .pem will live on the machine running the bot (written into --env-out as is)")
     ap.add_argument("--state", default=os.path.expanduser("~/arbscan-subaccount.json"))
     ap.add_argument("--execute", action="store_true")
     a = ap.parse_args()

@@ -84,8 +84,8 @@ class TickTests(Base):
         o.game.live = True
         seen = {}
 
-        def run(db, opp_, brokers_, cfg_, budget, log, moves=None):
-            seen["budget"] = budget
+        def run(db, opp_, brokers_, cfg_, budget, log, moves=None, leg_budgets=None):
+            seen["budget"], seen["legs"] = budget, leg_budgets
             return {}
         if kalshi_shards is not None:
             self.paper["Kalshi"].shards = kalshi_shards
@@ -127,10 +127,13 @@ class TickTests(Base):
         cfg = trader.Config(min_profit=0.01, min_roi=0.0, in_play_only=True)
         seen, _, logs = self._tick(o, cfg, kalshi_shards={0: 0.0, 3: 25.0})
         self.assertNotIn("budget", seen)               # $0 on shard 0 -> no trade
-        self.assertTrue(any("cash $0" in x for x in logs))
+        self.assertTrue(any("legs $0/" in x for x in logs))
         trader._cash.update(at=0.0, values=None)
         seen, _, _ = self._tick(o, cfg, kalshi_shards={0: 10.0, 3: 15.0})
-        self.assertAlmostEqual(seen["budget"], min(cfg.max_per_trade, 10.0 * 2 * 0.95))
+        # the Kalshi leg is capped by ITS shard's cash, the Polymarket leg by its own (not half the pair each)
+        self.assertAlmostEqual(seen["legs"]["a"], 10.0 * 0.95)
+        self.assertGreater(seen["legs"]["b"], 1000)
+        self.assertAlmostEqual(seen["budget"], cfg.max_per_trade)
 
 
 class KalshiShardBalanceTests(unittest.TestCase):

@@ -230,10 +230,14 @@ class KalshiBroker:
             r = self._req("POST", "/portfolio/events/orders", body)
         except Exception as e:
             return Fill(self.venue, action, c.label, status="error", error=str(e))
-        filled = float(r.get("fill_count") or 0)
-        avg_yes = float(r.get("average_fill_price") or 0)
-        avg = avg_yes if is_yes else (1 - avg_yes if filled else 0)
-        fee = float(r.get("average_fee_paid") or 0) * filled
+        try:
+            filled = float(r.get("fill_count") or 0)
+            avg_yes = float(r.get("average_fill_price") or 0)
+            avg = avg_yes if is_yes else (1 - avg_yes if filled else 0)
+            fee = float(r.get("average_fee_paid") or 0) * filled
+        except (TypeError, ValueError, AttributeError) as e:   # an unreadable reply must not escape execute()
+            return Fill(self.venue, action, c.label, status="error", order_id=str((r or {}).get("order_id", "")),
+                        error=f"unreadable order reply ({e}): {str(r)[:300]}", raw={"request_side": book_side})
         return Fill(self.venue, action, c.label, filled, avg, fee, r.get("order_id", ""),
                     "filled" if filled else "no fill", raw={**r, "request_side": book_side, "request_price": body["price"]})
 
@@ -304,7 +308,11 @@ class PolymarketBroker:
             r = self._req("POST", "/v1/orders", body)
         except Exception as e:
             return Fill(self.venue, action, c.label, status="error", error=str(e))
-        return self._result(c, action, r, body)
+        try:
+            return self._result(c, action, r, body)
+        except Exception as e:   # an unreadable reply must not escape execute(): the order may have filled
+            return Fill(self.venue, action, c.label, status="error", order_id=str((r or {}).get("id", "")),
+                        error=f"unreadable order reply ({type(e).__name__}: {e}): {str(r)[:300]}")
 
     def _result(self, c: Contract, action: str, r: dict, body: dict) -> Fill:
         oid = r.get("id", "")

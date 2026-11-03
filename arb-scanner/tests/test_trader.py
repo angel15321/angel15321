@@ -201,6 +201,93 @@ class ExecuteTests(Base):
             self.assertEqual(trader.settle(self.db, **QUIET), 1)
         self.assertAlmostEqual(trader.summary(self.db)["realized"], 5.0)
 
+    def test_settle_exposed_one_sided_without_a_kickoff_wait(self):
+        # a HELD leg (Polymarket Under 44.5, 100 @ .50) settles from its venue alone as soon as the exchange
+        # says so: an hour after kickoff (an NBA game is over in ~2h15m; the old rule waited 3 h)
+        for payout, pnl in ((1.0, 50.0), (0.0, -50.0)):
+            row = ExecuteTests._leg2_moves(self, self.cfg)
+            self.assertEqual((row["outcome"], row["qty_a"], row["qty_b"]), ("exposed", 0.0, 100.0))
+            hour_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+            self.db.execute("UPDATE trades SET kickoff=? WHERE id=?", (hour_ago, row["id"]))
+            seen = []
+            with mock.patch("arbscan.scanner.settlement", side_effect=lambda ref, v: seen.append(v) or payout):
+                self.assertEqual(trader.settle(self.db, **QUIET), 1)
+            self.assertEqual(seen, ["Polymarket"])          # the empty Kalshi leg is not looked up
+            r = self.db.execute("SELECT status, payout, pnl FROM trades WHERE id=?", (row["id"],)).fetchone()
+            self.assertEqual(r["status"], "settled")
+            self.assertAlmostEqual(r["pnl"], pnl)
+
+    def test_settle_skips_games_not_started_and_paces_itself(self):
+        row = ExecuteTests._leg2_moves(self, self.cfg)        # kickoff = tomorrow
+        with mock.patch("arbscan.scanner.settlement") as st:
+            self.assertEqual(trader.settle(self.db, **QUIET), 0)
+        st.assert_not_called()
+        hour_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+        self.db.execute("UPDATE trades SET kickoff=? WHERE id=?", (hour_ago, row["id"]))
+        trader._settled_at = 0.0
+        with mock.patch("arbscan.scanner.settlement", return_value=None) as st:
+            trader.settle(self.db, min_gap=60.0, **QUIET)
+            trader.settle(self.db, min_gap=60.0, **QUIET)   # within the gap: no second exchange read
+        self.assertEqual(st.call_count, 1)
+
+    def test_error_after_leg1_fill_is_recorded(self):
+        o = opp([(0.45, 100)], [(0.50, 100)])              # leg 1 = Polymarket (paper), leg 2 = Kalshi raises
+
+        class Broken:
+            def buy(self, *a, **k):
+                raise KeyError("value")
+        with mock.patch("arbscan.scanner.refresh"), self.assertRaises(KeyError):
+            trader.execute(self.db, o, {"Kalshi": Broken(), "Polymarket": self.paper["Polymarket"]}, self.cfg,
+                           budget=1000, **QUIET)
+        r = self.db.execute("SELECT outcome, status, qty_a, qty_b, cash_out, note FROM trades").fetchone()
+        self.assertEqual((r["outcome"], r["status"], r["qty_a"], r["qty_b"]), ("error", "open", 0.0, 100.0))
+        self.assertAlmostEqual(r["cash_out"], 50.0)
+        self.assertIn("KeyError", r["note"])
+        self.assertEqual(trader.recent_failures(self.db, "dry", 2), 1)   # counts toward the halt
+        self.assertTrue(trader.recently_taken(self.db, o.key, 10))      # and the cooldown
+
+    def test_fractional_leg1_fill_hedged_in_whole_kalshi_contracts(self):
+        o = opp([(0.45, 100)], [(0.50, 100)])              # leg 1 = Polymarket, leg 2 = Kalshi
+        got = []
+        k = self.paper["Kalshi"]
+        orig = k.buy
+        k.buy = lambda cn, q, lim, **kw: got.append(q) or orig(cn, q, lim, **kw)
+
+        class Fractional:
+            def buy(self, cn, qty, limit, notional_hint=None):
+                return brokers.Fill("Polymarket", "buy", cn.label, 19.37, 0.50, 0.0, "p1", "filled")
+        with mock.patch("arbscan.scanner.refresh"):
+            row = trader.execute(self.db, o, {"Kalshi": k, "Polymarket": Fractional()}, self.cfg, budget=1000, **QUIET)
+        self.assertEqual(got, [19.0])                      # never a fractional Kalshi count
+        self.assertEqual((row["qty_a"], row["qty_b"]), (19.0, 19.37))
+        self.assertEqual(row["outcome"], "hedged")         # 0.37 ct that no Kalshi order can hedge is dust
+        self.assertIn("dust", row["note"])
+        self.assertEqual(trader.recent_failures(self.db, "dry", 2), 0)
+
+    def test_parallel_swap_holds_the_leg_that_filled(self):
+        cfg = trader.Config(min_profit=0.01, min_roi=0.0, legs="parallel")
+        o = opp([(0.45, 100)], [(0.50, 100)])              # a = Kalshi fills, b = Polymarket vanishes
+
+        def gone(cs):
+            for x in cs:
+                if x.venue == "Polymarket":
+                    x.book = Book(asks=[(0.80, 100)])
+        with mock.patch("arbscan.scanner.refresh", side_effect=gone):
+            row = trader.execute(self.db, o, self.paper, cfg, budget=1000, **QUIET)
+        self.assertEqual((row["outcome"], row["qty_a"], row["qty_b"]), ("exposed", 100.0, 0.0))
+        self.assertAlmostEqual(row["cash_out"], 45.0)
+        self.assertEqual(sum(1 for f in json.loads(row["fills"]) if f["venue"] == "Polymarket"), 3)   # 1 + 2 hedge tries
+
+    def test_per_leg_budget_caps_the_expensive_leg(self):
+        # Kalshi .85 + Polymarket .12: a $20 pair cap alone would send a $17 Kalshi leg against $11.40 of shard cash
+        o = opp([(0.85, 100)], [(0.12, 100)], fee_a=K, fee_b=P)
+        with mock.patch("arbscan.scanner.refresh"):
+            row = trader.execute(self.db, o, self.paper, self.cfg, budget=20, leg_budgets={"a": 11.4, "b": 23.75}, **QUIET)
+        self.assertEqual(row["outcome"], "hedged")
+        kal = next(f for f in json.loads(row["fills"]) if f["venue"] == "Kalshi")
+        self.assertLessEqual(kal["qty"] * kal["avg_price"] + kal["fee"], 11.4)
+        self.assertEqual(row["qty_a"], 13)
+
 
 class SafetyTests(Base):
     def test_kill_file_stops_loop(self):

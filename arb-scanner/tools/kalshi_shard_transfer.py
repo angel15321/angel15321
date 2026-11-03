@@ -3,7 +3,7 @@
 Kalshi markets live on numbered shards (exchange_index): NFL on 0, NBA and all
 tennis on 3 (11-2026). A subaccount trades a shard only with cash on that shard;
 on 11-03 both orders the bot sent to shard-3 markets came back
-403 PERMISSION_DENIED_FOR_SUBTRADER while subaccount 2 held $25 on shard 0 only.
+403 PERMISSION_DENIED_FOR_SUBTRADER while the arb subaccount held its cash on shard 0 only.
 
 Uses the bot's own restricted key (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH),
 so it can only move money inside its own subaccount. Nothing moves without

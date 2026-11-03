@@ -24,6 +24,7 @@ URL = "wss://api.polymarket.us/v1/ws/markets"
 PATH = "/v1/ws/markets"
 CHUNK = 100              # markets per subscription (server limit)
 DEAD_AFTER = 5.0         # seconds without any message -> connection presumed dead
+IDLE_EVICT = 3600.0      # seconds a market may go unrequested before it leaves wanted/books
 
 
 class BookFeed:
@@ -34,6 +35,8 @@ class BookFeed:
         self.url = url
         self.books: dict[str, tuple[float, dict]] = {}   # slug -> (received at, marketData)
         self.wanted: set[str] = set()
+        self._asked: dict[str, float] = {}                # slug -> last want() time, for eviction
+        self._evicted_at = time.time()
         self._sent: set[str] = set()                      # slugs subscribed on the current connection
         self._lock = threading.Lock()
         self.connected = False
@@ -54,11 +57,25 @@ class BookFeed:
 
     def want(self, slugs) -> set[str]:
         """Make sure these markets are subscribed; returns the ones that were not yet."""
-        new = set(slugs) - self.wanted
-        if not new:
-            return new
+        now = time.time()
+        slugs = set(slugs)
+        asked = self._asked
+        for s in slugs:
+            asked[s] = now
+        new = slugs - self.wanted
         with self._lock:
             self.wanted |= new
+            if now - self._evicted_at > IDLE_EVICT:
+                # markets nobody asked for in an hour (settled games) leave wanted/books, so a reconnect
+                # does not re-subscribe every market ever seen
+                self._evicted_at = now
+                idle = {s for s in self.wanted if now - asked.get(s, 0.0) > IDLE_EVICT}
+                self.wanted -= idle
+                for s in idle:
+                    self.books.pop(s, None)
+                    asked.pop(s, None)
+        if not new:
+            return new
         if self._loop and self.connected:
             asyncio.run_coroutine_threadsafe(self._subscribe_missing(), self._loop)
         return new
