@@ -145,12 +145,28 @@ class ExecuteTests(Base):
             return trader.execute(self.db, o, self.paper, cfg, budget=1000, **QUIET)
 
     def test_unwind_when_hedge_fails(self):
+        self.cfg.unwind_max_loss = 0.01                   # bid .49 vs paid .50: 1c beyond fees is allowed
         row = self._leg2_moves(self.cfg)
         self.assertEqual(row["outcome"], "unwound")
         self.assertEqual(row["status"], "closed")
         self.assertAlmostEqual(row["cash_out"], 1.0)      # bought 100 @ .50, sold 100 @ .49
         self.assertAlmostEqual(row["pnl"], -1.0)
         self.assertLess(row["qty_a"] + row["qty_b"], 0.01)
+
+    def test_sell_back_that_loses_more_than_fees_is_held(self):
+        # default: sell back only at >= the price paid; bid .49 < paid .50 -> keep leg 1 to settlement
+        sold = []
+        self.paper["Polymarket"].sell = lambda *x, **k: sold.append(x)
+        row = self._leg2_moves(self.cfg)
+        self.assertEqual(sold, [])
+        self.assertEqual(row["outcome"], "exposed")
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(row["qty_b"], 100)
+        self.assertIn("HELD to settlement", row["note"])
+
+    def test_sell_back_never_below_floor(self):
+        self.cfg.unwind_max_loss = 0.005                  # floor .495; bid .49 is under it -> held, no order
+        self.assertEqual(self._leg2_moves(self.cfg)["outcome"], "exposed")
 
     def test_hold_when_hedge_fails(self):
         self.cfg.on_fail = "hold"

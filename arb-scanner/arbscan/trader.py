@@ -77,6 +77,7 @@ class Config:
     hedge_attempts: int = 3
     on_fail: str = "unwind"           # unwind | hold
     unwind_slippage: float = 0.03     # accept up to 3c below best bid when unwinding
+    unwind_max_loss: float = 0.0      # $/contract a sell-back may lose beyond the fees; a worse bid -> hold to settlement
     cooldown_min: float = 10.0
     include_live_games: bool = False  # in-play arbs move fastest; off by default
     in_play_only: bool = False        # only games already in progress (implies include_live_games)
@@ -250,14 +251,20 @@ def execute(db, opp: engine.Opportunity, brokers: dict, cfg: Config, budget: flo
 
     if residual >= 0.01 and cfg.on_fail == "unwind":
         best_bid = c1.book.best_bid or 0
-        fu = brokers[c1.venue].sell(c1, residual, best_bid - cfg.unwind_slippage)
-        fills.append(fu)
-        qty1_held = q1 - fu.qty
-        note += f"; unwound {fu.qty:g} @ {fu.avg_price:.3f}" + (f" ({fu.error})" if fu.error else "")
-        if qty1_held - hedged < 0.01:
-            outcome = "unwound" if hedged == 0 else "hedged"
-            if hedged > 0:
-                note += " (partial size, rest unwound)"
+        # Selling at or above (price paid - unwind_max_loss) loses at most the fees plus that allowance.
+        # Below it the sale would cost more than the operator accepts, so the leg is held to settlement.
+        floor = f1.avg_price - cfg.unwind_max_loss
+        if best_bid + 1e-9 < floor:
+            note += f"; HELD to settlement: bid {best_bid:.3f} below sell-back floor {floor:.3f}"
+        else:
+            fu = brokers[c1.venue].sell(c1, residual, max(best_bid - cfg.unwind_slippage, floor))
+            fills.append(fu)
+            qty1_held = q1 - fu.qty
+            note += f"; unwound {fu.qty:g} @ {fu.avg_price:.3f}" + (f" ({fu.error})" if fu.error else "")
+            if qty1_held - hedged < 0.01:
+                outcome = "unwound" if hedged == 0 else "hedged"
+                if hedged > 0:
+                    note += " (partial size, rest unwound)"
 
     q_a, q_b = (qty1_held, hedged) if first == "a" else (hedged, qty1_held)
     return _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note=note, log=log, probe=probe)

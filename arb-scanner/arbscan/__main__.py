@@ -44,7 +44,7 @@ def cmd_run(a):
     cfg = trader.Config(
         live=a.live, max_per_trade=a.max_per_trade, max_daily_spend=a.max_daily, max_open=a.max_open,
         min_roi=a.min_roi, min_profit=a.min_profit, slippage=a.slippage, hedge_attempts=a.hedge_attempts,
-        on_fail=a.on_fail, cooldown_min=a.cooldown, include_live_games=a.include_live_games or a.in_play_only,
+        on_fail=a.on_fail, unwind_max_loss=a.unwind_max_loss, cooldown_min=a.cooldown, include_live_games=a.include_live_games or a.in_play_only,
         in_play_only=a.in_play_only, leg1=a.leg1,
         cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports)
     log = _log_to(a.log)
@@ -61,7 +61,8 @@ def cmd_run(a):
     else:
         log("DRY RUN — fills are simulated against live order books; nothing is sent. Add --live to trade.")
     log(f"Limits: ${cfg.max_per_trade:,.0f}/arb · ${cfg.max_daily_spend:,.0f}/day · ${cfg.max_open:,.0f} open · "
-        f"min ROI {cfg.min_roi * 100:.2f}% · min profit ${cfg.min_profit:.2f} · on failed hedge: {cfg.on_fail} · "
+        f"min ROI {cfg.min_roi * 100:.2f}% · min profit ${cfg.min_profit:.2f} · on failed hedge: {cfg.on_fail}"
+        f"{f' (loss <= fees + ${cfg.unwind_max_loss:.2f}/ct, else hold)' if cfg.on_fail == 'unwind' else ''} · "
         f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
         f" · leg 1: {cfg.leg1} · sports: {', '.join(cfg.sports)}")
     if not _attach_feed(log) and cfg.live:
@@ -167,6 +168,9 @@ def main(argv=None):
     r.add_argument("--hedge-attempts", type=int, default=3)
     r.add_argument("--on-fail", choices=["unwind", "hold"], default="unwind",
                    help="if leg 2 can't fill: sell leg 1 back (default) or keep it")
+    r.add_argument("--unwind-max-loss", type=float, default=0.0,
+                   help="$/contract a sell-back may lose beyond the fees (default 0: only sell at or above the price "
+                        "paid); a lower bid keeps leg 1 to settlement")
     r.add_argument("--include-live-games", action="store_true",
                    help="also trade games already in progress (fastest-moving, highest legging risk)")
     r.add_argument("--in-play-only", action="store_true",
