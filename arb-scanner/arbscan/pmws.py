@@ -43,6 +43,7 @@ class BookFeed:
         self.last_msg = 0.0
         self.reconnects = 0
         self.error = ""
+        self.on_update = None                   # callable(slug) after each book message (event trigger)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws = None
         self._thread = threading.Thread(target=self._run, name="pm-books", daemon=True)
@@ -156,5 +157,8 @@ class BookFeed:
         md = m.get("marketData")
         if md and md.get("marketSlug"):
             self.books[md["marketSlug"]] = (time.time(), md)
+            cb = getattr(self, "on_update", None)
+            if cb is not None:
+                cb(md["marketSlug"])
         elif m.get("error"):
             self.error = str(m["error"])[:200]

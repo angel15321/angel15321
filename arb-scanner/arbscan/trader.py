@@ -28,6 +28,7 @@ import datetime as dt
 import json
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 
@@ -101,6 +102,9 @@ class Config:
     sports: tuple[str, ...] = ("nfl",)  # nfl | nba | tennis
     legs: str = "sequential"          # sequential (stale leg first, then hedge) | parallel (both at once; a vanished
                                       # quote then leaves the OTHER leg filled -- 11-03 every miss was a vanished quote)
+    trigger: str = "scan"             # scan (price once per scan) | event (re-check a game on each book change)
+    event_gap: float = 0.05           # s: a game is re-checked at most this often on the event path
+    confirm_s: float = 0.03           # s: an event-path arb must still be there this long after first sighting
     max_book_age: float = 1.0         # s: an arb priced from an older Kalshi (REST) book is skipped
 
 
@@ -447,28 +451,106 @@ def make_brokers(cfg: Config, kalshi_demo: bool = False) -> dict:
     return {"Kalshi": KalshiBroker(demo=kalshi_demo), "Polymarket": PolymarketBroker()}
 
 
+class Trigger:
+    """Markets whose book just changed, filled by the feed threads, drained by the trading loop."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._dirty: set[str] = set()
+        self.event = threading.Event()
+
+    def mark(self, key: str) -> None:
+        with self._lock:
+            self._dirty.add(key)
+        self.event.set()
+
+    def take(self) -> set[str]:
+        with self._lock:
+            d, self._dirty = self._dirty, set()
+            self.event.clear()
+        return d
+
+
 def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool = False, log=print):
+    """Full scan every `interval` s (market lists, game state, balances, settlement). With --trigger event,
+    between scans every book change re-checks just its game (at most every cfg.event_gap), and an arb trades
+    only if it is still there cfg.confirm_s later (a quote moved as delete-then-add looks like a gap for a moment)."""
     mode = "live" if cfg.live else "dry"
+    state = {"games": [], "index": {}, "moves": {}, "confirm": {}, "due": {}, "last_eval": {},
+             "stats": {"wakes": 0, "evals": 0, "seen": 0, "blips": 0, "confirmed": 0}, "stats_at": time.time()}
+    trig = None
+    if cfg.trigger == "event":
+        trig = Trigger()
+        for feed in (polymarket._feed, kalshi._feed):
+            if feed is not None:
+                feed.on_update = trig.mark
+    next_scan = 0.0
     while True:
-        if os.path.exists(cfg.kill_file):
-            log(f"Kill switch: '{cfg.kill_file}' exists — stopping.")
-            return
+        if time.time() >= next_scan:
+            if os.path.exists(cfg.kill_file):
+                log(f"Kill switch: '{cfg.kill_file}' exists — stopping.")
+                return
+            try:
+                settle(db, log, min_gap=SETTLE_GAP)     # before the halt check: held positions settle while halted
+            except Exception as e:
+                log(f"! settle error: {e}")
+            streak = recent_failures(db, mode, cfg.max_failures)
+            if streak >= cfg.max_failures:
+                log(f"Halting: last {streak} trades failed to hedge. Review the log, then run again.")
+                return
+            t0 = time.time()
+            try:
+                _tick(db, cfg, brokers, days, log, state if trig is not None else None)
+            except Exception as e:  # keep the bot alive across transient API errors
+                log(f"! scan error: {type(e).__name__}: {e}")
+            if once:
+                return
+            next_scan = t0 + max(1.0, interval)
+            if trig is not None and time.time() - state["stats_at"] >= 60:
+                s = state["stats"]
+                log(f"  event trigger, last {time.time() - state['stats_at']:.0f}s: {s['wakes']:,} wakes · "
+                    f"{s['evals']:,} game checks · {s['seen']} arbs seen · {s['blips']} gone within "
+                    f"{cfg.confirm_s * 1000:.0f} ms · {s['confirmed']} confirmed")
+                state["stats"] = {k: 0 for k in s}
+                state["stats_at"] = time.time()
+        if trig is None:
+            time.sleep(max(0.0, next_scan - time.time()))
+            continue
+        due = min([next_scan] + list(state["due"].values()))
+        trig.event.wait(max(0.0, due - time.time()))
         try:
-            settle(db, log, min_gap=SETTLE_GAP)     # before the halt check: held positions settle while halted
+            if _on_events(db, cfg, brokers, state, trig.take(), log) == "halt":
+                next_scan = 0.0                          # the halt check at the top of the loop reports it
         except Exception as e:
-            log(f"! settle error: {e}")
-        streak = recent_failures(db, mode, cfg.max_failures)
-        if streak >= cfg.max_failures:
-            log(f"Halting: last {streak} trades failed to hedge. Review the log, then run again.")
-            return
-        t0 = time.time()
-        try:
-            _tick(db, cfg, brokers, days, log)
-        except Exception as e:  # keep the bot alive across transient API errors
-            log(f"! scan error: {type(e).__name__}: {e}")
-        if once:
-            return
-        time.sleep(max(1.0, interval - (time.time() - t0)))
+            log(f"! event error: {type(e).__name__}: {e}")
+
+
+def _on_events(db, cfg: Config, brokers: dict, state: dict, keys: set[str], log) -> str | None:
+    """Re-check the games whose books changed (or whose parked arb is due its confirm look)."""
+    now = time.time()
+    state["stats"]["wakes"] += 1
+    games = {}
+    for k in keys:
+        g = state["index"].get(k)
+        if g is not None:
+            games[g.key] = g
+    by_key = {g.key: g for g in state["games"]}
+    for gk, at in list(state["due"].items()):
+        if at <= now and gk in by_key:
+            games[gk] = by_key[gk]
+    run_now = []
+    for gk, g in games.items():
+        wait = state["last_eval"].get(gk, 0.0) + cfg.event_gap - now
+        if wait > 0:
+            state["due"][gk] = min(state["due"].get(gk, float("inf")), now + wait)   # throttled: look again soon
+            continue
+        state["due"].pop(gk, None)
+        state["last_eval"][gk] = now
+        run_now.append(g)
+    if not run_now:
+        return None
+    state["stats"]["evals"] += len(run_now)
+    return _evaluate(db, cfg, brokers, run_now, state["moves"], log, state=state)
 
 
 _last_mid: dict[str, float] = {}   # contract id -> mid at the previous scan
@@ -521,7 +603,7 @@ def startup_balances(brokers: dict, tries: int = 5, wait: float = 2.0, log=print
             time.sleep(wait * (i + 1))
 
 
-def _tick(db, cfg: Config, brokers: dict, days: float, log):
+def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None = None):
     mode = "live" if cfg.live else "dry"
     # In-play scans only fetch games starting within 30 min (Kalshi kickoffs are
     # estimates, so the exact in-progress filter is applied below).
@@ -536,6 +618,22 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
         games = snap.games
     else:
         games = [g for g in snap.games if not g.started(now) and g.start is not None]
+    if state is not None:
+        # what the event trigger needs between scans: the games, and which game each market belongs to
+        state["games"], state["moves"] = games, moves
+        state["index"] = {c.ref["slug"] if c.venue == "Polymarket" else c.ref["ticker"]: g
+                          for g in games for c in g.contracts}
+        live = {g.key for g in games}
+        for d in (state["due"], state["last_eval"]):
+            for gk in [k for k in d if k not in live]:
+                d.pop(gk)
+    return _evaluate(db, cfg, brokers, games, moves, log, scan_errors=snap.errors, state=state)
+
+
+def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=None, state: dict | None = None):
+    """Price `games` from the live books and trade what qualifies. scan_errors is not None on a full scan
+    (which logs its status line); state is the event trigger's (arbs confirm before trading) or None."""
+    mode = "live" if cfg.live else "dry"
     feed = polymarket._feed
     if feed is not None:
         # The Polymarket books were copied from the feed at the START of the scan; the Kalshi REST
@@ -556,9 +654,12 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
     stale_note = (f" · {len(arbs) - len(fresh)} skipped (Kalshi book > {cfg.max_book_age:g}s old)"
                   if len(fresh) < len(arbs) else "")
     feed_note = " · Polymarket feed DOWN" if feed is not None and not feed.alive() else ""
-    log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
-        f"{sum(len(g.contracts) for g in games):,} contracts · {len(fresh)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
-        + stale_note + feed_note + (" · " + "; ".join(snap.errors) if snap.errors else ""))
+    if scan_errors is not None:
+        log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
+            f"{sum(len(g.contracts) for g in games):,} contracts · {len(fresh)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
+            + stale_note + feed_note + (" · " + "; ".join(scan_errors) if scan_errors else ""))
+    if state is not None:
+        fresh = _confirmed(cfg, state, games, fresh, t_now)
     for o in fresh:
         if recently_taken(db, o.key, cfg.cooldown_min):
             continue
@@ -594,4 +695,27 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log):
         if done:
             _cash["at"] = 0.0          # cash changed (or may have): re-read before the next trade
         if recent_failures(db, mode, cfg.max_failures) >= cfg.max_failures:
-            return
+            return "halt"
+    return None
+
+
+def _confirmed(cfg: Config, state: dict, games, fresh, now: float) -> list:
+    """Arbs seen for at least cfg.confirm_s on the event path. A first sighting is parked and its game
+    re-checked when the confirm time is up; an arb that is gone at that look was a blip."""
+    confirm, out = state["confirm"], []
+    here = {o.key for o in fresh}
+    checked = {g.key for g in games}
+    for k in [k for k, (_, gk) in confirm.items() if gk in checked and k not in here]:
+        confirm.pop(k)                                   # parked arb of a re-checked game that vanished
+        state["stats"]["blips"] += 1
+    for o in fresh:
+        first = confirm.get(o.key)
+        if first is None:
+            confirm[o.key] = (now, o.game.key)
+            state["stats"]["seen"] += 1
+            state["due"][o.game.key] = min(state["due"].get(o.game.key, float("inf")), now + cfg.confirm_s)
+        elif now - first[0] >= cfg.confirm_s:
+            confirm.pop(o.key)
+            state["stats"]["confirmed"] += 1
+            out.append(o)
+    return out

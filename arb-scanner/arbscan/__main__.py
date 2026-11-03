@@ -57,7 +57,8 @@ def cmd_run(a):
         on_fail=a.on_fail, unwind_max_loss=a.unwind_max_loss, cooldown_min=a.cooldown, include_live_games=a.include_live_games or a.in_play_only,
         in_play_only=a.in_play_only, leg1=a.leg1,
         cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports,
-        legs=a.legs, max_book_age=a.max_book_age)
+        legs=a.legs, max_book_age=a.max_book_age, trigger=a.trigger, event_gap=a.event_gap_ms / 1000,
+        confirm_s=a.confirm_ms / 1000)
     log = _log_to(a.log)
     try:
         brokers = trader.make_brokers(cfg, kalshi_demo=a.kalshi_demo)
@@ -78,7 +79,10 @@ def cmd_run(a):
         f"{f' (loss <= fees + ${cfg.unwind_max_loss:.2f}/ct, else hold)' if cfg.on_fail == 'unwind' else ''} · "
         f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
         f" · legs: {cfg.legs}{'' if cfg.legs == 'parallel' else f' (leg 1: {cfg.leg1})'}"
-        f" · Kalshi books <= {cfg.max_book_age:g}s old · sports: {', '.join(cfg.sports)}")
+        f" · Kalshi books <= {cfg.max_book_age:g}s old"
+        + (f" · trigger: every book change (confirm {cfg.confirm_s * 1000:.0f} ms, per game <= 1/{cfg.event_gap * 1000:.0f} ms)"
+           if cfg.trigger == "event" else f" · trigger: scan every {max(1.0, a.interval):g}s")
+        + f" · sports: {', '.join(cfg.sports)}")
     if not _attach_feed(log) and cfg.live:
         sys.exit("Live trading needs the Polymarket US websocket (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY): "
                  "the REST books lag the exchange by 10-30 s.")
@@ -201,6 +205,13 @@ def main(argv=None):
     r.add_argument("--legs", choices=["sequential", "parallel"], default="sequential",
                    help="cross-venue pairs: leg 1 first, then leg 2 (default), or both at once -- faster, but a "
                         "quote that vanishes leaves the other leg filled and held")
+    r.add_argument("--trigger", choices=["scan", "event"], default="scan",
+                   help="scan: price once per scan (default). event: also re-check a game the moment either feed "
+                        "changes one of its books (needs both websockets)")
+    r.add_argument("--event-gap-ms", type=float, default=50,
+                   help="event trigger: re-check one game at most this often (default 50 ms)")
+    r.add_argument("--confirm-ms", type=float, default=30,
+                   help="event trigger: an arb must still be there this long after it first appears (default 30 ms)")
     r.add_argument("--max-book-age", type=float, default=1.0,
                    help="skip an arb priced from a Kalshi book older than this many seconds (default 1.0); Polymarket books are re-read from the live feed right before pricing")
     r.add_argument("--cross-venue-only", action="store_true")

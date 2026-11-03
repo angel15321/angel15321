@@ -96,6 +96,7 @@ class BookFeed:
         self.last_msg = self.last_book = 0.0
         self.reconnects = self.gaps = self.resyncs = 0
         self.error = ""
+        self.on_update = None                   # callable(ticker) after each applied snapshot/delta (event trigger)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws = None
         self._thread = threading.Thread(target=self._run, name="kalshi-books", daemon=True)
@@ -296,3 +297,6 @@ class BookFeed:
             else:
                 self._lag_run = 0
         self.last_book = time.time()
+        cb = getattr(self, "on_update", None)
+        if cb is not None:
+            cb(t)
