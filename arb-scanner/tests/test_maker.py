@@ -180,11 +180,29 @@ class ChurnTests(Base):
         self.assertEqual(self.paper["Polymarket"].quotes[maker.STATE.quote.oid]["price"], 0.41)   # same order id
         self.assertEqual(self.db.execute("SELECT price FROM quotes").fetchone()[0], 0.41)
 
+    def test_modify_applied_a_moment_later_still_counts(self):
+        g, pm, k = pair()
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        b = self.paper["Polymarket"]
+        reads = {"n": 0}
+        real = b.order_state
+
+        def lagging(c_, oid):
+            reads["n"] += 1
+            st = real(c_, oid)
+            return {**st, "price": 0.39} if reads["n"] < 3 else st     # the first two reads still show the old price
+        b.order_state = lagging
+        pm.book.bids = [(0.40, 50)]
+        maker.STATE.quote.priced_at -= 10
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        self.assertTrue(maker.STATE.modify_ok)
+        self.assertAlmostEqual(maker.STATE.quote.price, 0.41)
+
     def test_modify_that_does_not_take_falls_back_to_cancel_and_post(self):
         g, pm, k = pair()
         maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
         old = maker.STATE.quote.oid
-        self.paper["Polymarket"].modify = lambda *a, **kw: (False, "HTTP 400: bad modify")
+        self.paper["Polymarket"].modify = lambda *a, **kw: (False, "HTTP 400: bad modify")   # refused outright
         pm.book.bids = [(0.40, 50)]
         maker.STATE.quote.priced_at -= 10
         logs = []

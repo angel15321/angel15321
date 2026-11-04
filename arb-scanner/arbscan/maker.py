@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS quotes (
 );
 """
 MODIFY_CHECKS = 3        # the first modifies of a run are read back to confirm the new price took
+MODIFY_WAIT = 1.5        # s: a modify is applied a moment after its (empty) reply -- 11-04 01:52Z the instant read
+                         # still showed the old price and the run wrongly fell back to cancel + post
+SWAP_AGE = 30.0          # s: a quote must have rested this long before a better pair elsewhere may replace it
 
 
 def connect(db) -> None:
@@ -300,7 +303,7 @@ def step(db, cfg, brokers, games, log, full: bool = False):
             c = by_key.get(q.key)
             return c.score if c is not None else 0.0
         weak = min(s.quotes.values(), key=score)
-        if weak.game_key not in in_view or best.score <= score(weak) * 1.5 or now - weak.priced_at < cfg.maker_reprice:
+        if weak.game_key not in in_view or best.score <= score(weak) * 1.5 or now - weak.posted_at < SWAP_AGE:
             return None
         s.stats["repriced"] += 1
         if pull(db, cfg, brokers, weak, f"swapped for {best.game.title} {best.pm.label} @ {best.price:.2f}", log) == "halt":
@@ -392,14 +395,21 @@ def reprice(db, cfg, brokers, q: Quote, c: Cand, log):
     if ok and s.modify_checks < MODIFY_CHECKS:
         # read the order back: the reply is empty on success, so the first few are confirmed from the order itself
         s.modify_checks += 1
-        try:
-            st = b.order_state(q.pm, q.oid)
+        deadline = time.time() + MODIFY_WAIT
+        while True:
+            try:
+                st = b.order_state(q.pm, q.oid)
+            except Exception as e:
+                ok, err = False, f"read-back failed: {e}"
+                break
             if st.get("cum"):
                 return _filled(db, cfg, brokers, q, st, log)
-            if st.get("done") or abs((st.get("price") or c.price) - c.price) > 1e-6:
-                ok, err = False, f"order reads {st.get('state')} @ {st.get('price')} after the modify"
-        except Exception as e:
-            ok, err = False, f"read-back failed: {e}"
+            took = st.get("price") is None or abs(st["price"] - c.price) < 1e-6
+            if st.get("done") or took or time.time() >= deadline:
+                if st.get("done") or not took:
+                    ok, err = False, f"order reads {st.get('state')} @ {st.get('price')} {MODIFY_WAIT:g}s after the modify"
+                break
+            time.sleep(0.1)
     if not ok:
         s.modify_ok = False
         log(f"  ! modify did not take ({q.title} {q.oid}): {err} -- re-pricing by cancel + post from now on")
