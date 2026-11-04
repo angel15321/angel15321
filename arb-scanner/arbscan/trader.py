@@ -119,7 +119,9 @@ class Config:
     maker_ttl: float = 120.0          # s: a quote is pulled and re-priced after this long
     maker_reprice: float = 2.0        # s: at most one re-post per this long
     maker_poll: float = 1.0           # s: REST fill check when the private order stream has nothing
-    maker_in_play: bool = False       # quote games in progress too (off: pre-game only)
+    maker_in_play: tuple = ()         # sports whose games in progress may be quoted too (True = all; () = pre-game only)
+    maker_live_edge: float = 0.04     # $ per pair a quote on a game in progress must make (news moves Kalshi first)
+    maker_live_quotes: int = 2        # of the quote slots, at most this many on games in progress
     maker_horizon_h: float = 24.0     # quote games starting within this many hours
     maker_max_qty: float = 0.0        # contracts per quote cap (0 = only the $ caps)
     maker_max_rejects: int = 3        # Polymarket refusing this many quotes in a row pauses maker mode
@@ -739,7 +741,7 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None =
     if cfg.maker:
         # pre-game games inside the horizon (+ in-play ones with --maker-in-play)
         games = [g for g in snap.games if (not g.started(now) and g.start is not None)
-                 or (cfg.maker_in_play and g.started(now) and (g.live is not None or now - dt.timedelta(hours=5) < g.start))]
+                 or (maker.live_ok(cfg, g) and g.started(now) and (g.live is not None or now - dt.timedelta(hours=5) < g.start))]
     elif cfg.in_play_only:
         # A game with a venue live flag (tennis) is in play exactly while the flag is on.
         games = [g for g in snap.games if g.started(now)

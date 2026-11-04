@@ -1,4 +1,4 @@
-"""NFL and NBA team identities and the codes/names each venue uses for them."""
+"""NFL, NBA and NHL team identities and the codes/names each venue uses for them."""
 from __future__ import annotations
 
 # Canonical abbreviation -> (city, nickname)
@@ -33,8 +33,18 @@ NBA = {"ATL", "BKN", "BOS", "CHA", "CHI", "CLE", "DAL", "DEN", "DET", "GSW", "HO
 NBA_ALIASES = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "PHO": "PHX", "SA": "SAS", "BRK": "BKN", "UTAH": "UTA"}
 
 
+# NHL: Kalshi codes are canonical; Polymarket US slugs use mon / nas / veg / was for MTL / NSH / VGK / WSH.
+NHL = {"ANA", "BOS", "BUF", "CAR", "CBJ", "CGY", "CHI", "COL", "DAL", "DET", "EDM", "FLA", "LA", "MIN", "MTL", "NJ",
+       "NSH", "NYI", "NYR", "OTT", "PHI", "PIT", "SEA", "SJ", "STL", "TB", "TOR", "UTA", "VAN", "VGK", "WPG", "WSH"}
+NHL_ALIASES = {"MON": "MTL", "NAS": "NSH", "VEG": "VGK", "WAS": "WSH", "LAK": "LA", "NJD": "NJ", "SJS": "SJ",
+               "TBL": "TB", "VGS": "VGK"}
+
+
 def from_code(code: str, sport: str = "nfl") -> str | None:
     code = code.upper()
+    if sport == "nhl":
+        code = NHL_ALIASES.get(code, code)
+        return code if code in NHL else None
     if sport == "nba":
         code = NBA_ALIASES.get(code, code)
         return code if code in NBA else None

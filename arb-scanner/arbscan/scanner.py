@@ -24,7 +24,7 @@ def snapshot(days: float = 8, poly_fee: float | None = None, kalshi_direct: bool
     errors: list[str] = []
     results: dict[str, dict[str, Game]] = {}
     jobs = {}
-    for sp in ("nfl", "nba"):
+    for sp in ("nfl", "nba", "nhl"):
         if sp in sports:
             jobs[f"Polymarket {sp}"] = lambda sp=sp: polymarket.fetch(horizon, poly_fee, sp)
             jobs[f"Kalshi {sp}"] = lambda sp=sp: kalshi.fetch(horizon, kalshi_direct, sp)

@@ -75,6 +75,7 @@ class Quote:
     pm: Contract | None = None   # latest contract objects (books are refreshed every scan / event)
     k: Contract | None = None
     game: object = None
+    live: bool = False           # posted on a game in progress (live edge, stricter pull)
 
     def outlay(self) -> float:
         fee = self.k.fee.per_contract(self.k_ask) if self.k is not None else 0.0
@@ -133,17 +134,33 @@ class Cand:
     qty: float
     k_ask: float
     edge: float               # $ per pair after fees, at our price and the Kalshi ask
+    live: bool = False
 
     @property
     def score(self) -> float:
         return self.edge * self.qty
 
 
-def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own) -> Cand | None:
+def live_sports(cfg) -> set:
+    """Sports whose games in progress may be quoted: cfg.maker_in_play is a sport tuple (True = every sport)."""
+    v = cfg.maker_in_play
+    if v is True:
+        return set(cfg.sports)
+    return set(v or ())
+
+
+def live_ok(cfg, g) -> bool:
+    return g.sport in live_sports(cfg)
+
+
+def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own, live: bool | None = None) -> Cand | None:
     """The quote for one pair, or None when it cannot be quoted at the top of the Polymarket book.
-    `own` = {pm contract id: Quote} (or one Quote / None)."""
+    `own` = {pm contract id: Quote} (or one Quote / None). A game in progress needs cfg.maker_live_edge."""
     if isinstance(own, Quote):
         own = {own.pm_id: own}
+    if live is None:
+        live = not _pregame(g, dt.datetime.now(dt.timezone.utc))
+    need = cfg.maker_live_edge if live else cfg.maker_edge
     a, b = (pm, k) if pm.side == "gt" else (k, pm)
     if b.line < a.line:
         return None
@@ -155,7 +172,7 @@ def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own) -> Cand | 
         return None
     unit_k = ka + k.fee.per_contract(ka)
     tick = pm.tick or 0.01
-    ceiling = floor_to(guaranteed - unit_k - cfg.maker_edge + 1e-9, tick)
+    ceiling = floor_to(guaranteed - unit_k - need + 1e-9, tick)
     bid = own_free_bid(pm, own or {})
     ask = pm.book.best_ask
     price = ceiling if bid is None else min(ceiling, round(bid + tick, 4))
@@ -170,23 +187,25 @@ def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own) -> Cand | 
     if qty < max(1.0, pm.min_size):
         return None
     edge = guaranteed - price - unit_k
-    if edge < cfg.maker_edge - 1e-9:
+    if edge < need - 1e-9:
         return None
-    return Cand(f"{a.id}|{b.id}", g, pm, k, pm is a, guaranteed, middle, price, qty, ka, edge)
+    return Cand(f"{a.id}|{b.id}", g, pm, k, pm is a, guaranteed, middle, price, qty, ka, edge, live)
 
 
 def candidates(cfg, games, budget: float, own) -> list[Cand]:
     if isinstance(own, Quote):
         own = {own.pm_id: own}
     out = []
+    now_dt = dt.datetime.now(dt.timezone.utc)
     for g in games:
+        live = not _pregame(g, now_dt)
         pms = [c for c in g.contracts if c.venue == "Polymarket"]
         ks = [c for c in g.contracts if c.venue == "Kalshi"]
         for pm in pms:
             for k in ks:
                 if k.axis != pm.axis or k.side == pm.side:
                     continue
-                c = price_pair(cfg, g, pm, k, budget, own)
+                c = price_pair(cfg, g, pm, k, budget, own, live)
                 if c is not None:
                     out.append(c)
     out.sort(key=lambda c: -c.score)
@@ -246,7 +265,7 @@ def step(db, cfg, brokers, games, log, full: bool = False):
                 return "halt"
     if s.paused:
         return None
-    ok = [g for g in games if _pregame(g, now_dt) or cfg.maker_in_play]
+    ok = [g for g in games if _pregame(g, now_dt) or live_ok(cfg, g)]
     if not ok or not _feeds_ok():
         return None
     from . import trader
@@ -292,8 +311,9 @@ def step(db, cfg, brokers, games, log, full: bool = False):
         return None
     games_used = {q.game_key for q in s.quotes.values()}
     ks_used = {q.k_id for q in s.quotes.values()}
+    n_live = sum(q.live for q in s.quotes.values())
     free = [c for c in cands if c.game.key not in games_used and c.k.id not in ks_used and c.key not in
-            {q.key for q in s.quotes.values()}]
+            {q.key for q in s.quotes.values()} and not (c.live and n_live >= cfg.maker_live_quotes)]
     if not free:
         return None
     best = free[0]
@@ -316,7 +336,7 @@ def step(db, cfg, brokers, games, log, full: bool = False):
     per_new = min(cfg.max_per_trade, (room - committed) / free_slots, pm_pot / slots)
     if per_new < 2:
         return None
-    best = price_pair(cfg, best.game, best.pm, best.k, per_new, own)
+    best = price_pair(cfg, best.game, best.pm, best.k, per_new, own, best.live)
     if best is None:
         return None
     k_pot = _k_pot(best.k, shards, k_all) - sum(q.qty * (q.k_ask + q.k.fee.per_contract(q.k_ask))
@@ -332,8 +352,8 @@ def _unsafe(cfg, q: Quote, seen: bool, now: float, now_dt) -> str:
         return "a book feed is down"
     if not seen:
         return "its market left the scan"
-    if q.game is not None and not _pregame(q.game, now_dt) and not cfg.maker_in_play:
-        return "the game started"
+    if q.game is not None and not q.live and not _pregame(q.game, now_dt):
+        return "the game started"                # a pre-game quote never carries into play (its edge was pre-game)
     if now - q.posted_at > cfg.maker_ttl:
         return f"older than {cfg.maker_ttl:g}s (refresh)"
     k = q.k
@@ -343,7 +363,9 @@ def _unsafe(cfg, q: Quote, seen: bool, now: float, now_dt) -> str:
         return "Kalshi book went stale"
     ka, size = k.book.asks[0]
     unit_k = ka + k.fee.per_contract(ka)
-    if q.guaranteed - q.price - unit_k < cfg.maker_edge / 2 - 1e-9:
+    if q.live and ka > q.k_ask + 1e-9:
+        return f"Kalshi ask ticked up {q.k_ask:.2f} -> {ka:.2f} (live)"   # in play any move against the hedge is news
+    if q.guaranteed - q.price - unit_k < (cfg.maker_live_edge if q.live else cfg.maker_edge) / 2 - 1e-9:
         return f"Kalshi ask moved {q.k_ask:.2f} -> {ka:.2f}"
     if size + 1e-9 < q.qty:
         return f"Kalshi ask thinned to {size:g} < {q.qty:g}"
@@ -372,9 +394,9 @@ def post(db, cfg, brokers, c: Cand, log):
                 _snap(c.pm), _snap(c.k), c.price, c.qty, c.k_ask, c.guaranteed))
     db.commit()
     s.quotes[f.order_id] = Quote(f.order_id, c.key, c.pm.id, c.k.id, c.game.key, c.game.title, c.price, c.qty,
-                                 c.k_ask, c.guaranteed, now, now, now, c.pm, c.k, c.game)
+                                 c.k_ask, c.guaranteed, now, now, now, c.pm, c.k, c.game, c.live)
     s.stats["posted"] += 1
-    log(f"  ◷ QUOTE {c.game.title}: bid {c.pm.label} @ {c.price:.2f} x{c.qty:g} on Polymarket; hedge "
+    log(f"  ◷ QUOTE{' LIVE' if c.live else ''} {c.game.title}: bid {c.pm.label} @ {c.price:.2f} x{c.qty:g} on Polymarket; hedge "
         f"{c.k.label} @ {c.k_ask:.2f} on Kalshi; edge {c.edge * 100:.1f} c/pair after fees "
         f"[{len(s.quotes)}/{max(1, cfg.maker_quotes)} resting]")
     return None

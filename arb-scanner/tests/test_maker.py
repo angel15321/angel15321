@@ -328,5 +328,71 @@ class PolymarketBrokerMakerTests(unittest.TestCase):
         self.assertAlmostEqual(st["avg"], 0.39)
 
 
+class LiveTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg = trader.Config(maker=True, max_per_trade=20, min_profit=0.0, maker_in_play=("nfl",))
+
+    def test_live_quote_needs_the_live_edge(self):
+        g, pm, k = pair(k_asks=[(0.55, 100)], pm_bids=[(0.39, 10)], pm_asks=[(0.47, 10)])
+        g.live = True
+        # pre-game this pair is quotable at 0.40 (edge 3.3c); live it needs 4c -> ceiling 0.39 = the bid -> join at 0.39
+        c = maker.price_pair(self.cfg, g, pm, k, 20, None)
+        self.assertTrue(c.live)
+        self.assertAlmostEqual(c.price, 0.39)
+        g2, pm2, k2 = pair(k_asks=[(0.57, 100)], pm_bids=[(0.39, 10)], pm_asks=[(0.47, 10)])
+        g2.live = True
+        self.assertIsNone(maker.price_pair(self.cfg, g2, pm2, k2, 20, None))       # live ceiling 0.37 < bid
+        g2.live = None
+        self.assertIsNotNone(maker.price_pair(self.cfg, g2, pm2, k2, 20, None))    # fine pre-game
+
+    def test_live_quote_pulled_on_any_kalshi_tick_against_it(self):
+        g, pm, k = pair()
+        g.live = True
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        self.assertTrue(maker.STATE.quote.live)
+        k.book.asks = [(0.56, 100)]                    # one tick: pre-game this would stay, live it goes
+        logs = []
+        maker.step(self.db, self.cfg, self.paper, [g], log=logs.append, full=True)
+        self.assertIsNone(maker.STATE.quote)
+        self.assertTrue(any("ticked up" in x for x in logs))
+
+    def test_sport_not_listed_is_not_quoted_live(self):
+        g, pm, k = pair()
+        g.live, g.sport = True, "nba"
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        self.assertEqual(maker.STATE.quotes, {})
+
+    def test_pre_game_quote_is_pulled_at_the_start_even_for_a_live_sport(self):
+        g, pm, k = pair()
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        self.assertFalse(maker.STATE.quote.live)
+        g.live = True
+        logs = []
+        maker.step(self.db, self.cfg, self.paper, [g], log=logs.append, full=True)
+        self.assertTrue(any("the game started" in x for x in logs))
+
+    def test_live_slot_cap(self):
+        cfg = trader.Config(maker=True, max_per_trade=20, min_profit=0.0, maker_in_play=("nfl",), maker_live_quotes=1)
+        g1, _, _ = pair()
+        g2, _, _ = second_game("LV")
+        g1.live = g2.live = True
+        for _ in range(4):
+            maker.STATE.last_post = 0
+            maker.step(self.db, cfg, self.paper, [g1, g2], full=True, **QUIET)
+        self.assertEqual(len(maker.STATE.quotes), 1)
+
+
+class NhlCodeTests(unittest.TestCase):
+    def test_polymarket_codes_map_to_kalshi(self):
+        from arbscan.teams import from_code
+        from arbscan.kalshi import split_teams
+        self.assertEqual([from_code(x, "nhl") for x in ("mon", "nas", "veg", "was", "la", "nj")],
+                         ["MTL", "NSH", "VGK", "WSH", "LA", "NJ"])
+        self.assertIsNone(from_code("GSW", "nhl"))
+        self.assertEqual(split_teams("NJNYI", "nhl"), ("NJ", "NYI"))
+        self.assertEqual(split_teams("TBMIN", "nhl"), ("TB", "MIN"))
+
+
 if __name__ == "__main__":
     unittest.main()

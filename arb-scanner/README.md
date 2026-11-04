@@ -68,8 +68,13 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
 - **Safety:** every quote is written to the `quotes` table before it is sent; quotes a crash left open are
   cancelled at the next start (a fill meanwhile becomes an `error` row, which halts). Every exit cancels the
   resting quote. Three refused quotes in a row pause maker mode.
-- **Scope:** games starting within `--maker-horizon-h` (24 h); `--maker-in-play` adds games in progress
-  (riskier: news moves Kalshi before a Polymarket cancel lands). The taker path is off while it runs.
+- **Scope:** games starting within `--maker-horizon-h` (24 h). `--maker-in-play nhl,tennis,nba,nfl` (no value =
+  every `--sports`) also quotes games in progress of those sports, with a bigger required edge
+  (`--maker-live-edge-c`, 4¢ a pair), at most `--maker-live-quotes` (2) of the slots, and a pull on ANY Kalshi
+  tick against the hedge (in play a tick is news). A pre-game quote never carries into play: it is pulled at
+  the start. Riskier: news moves Kalshi before a Polymarket cancel lands. The taker path is off while it runs.
+- **NHL** (`--sports nhl`): moneylines only. A shootout adds a goal to the final score and whether each
+  venue's puck line / total counts it is not checked, so those are not paired.
 
 ## Setup for live trading
 

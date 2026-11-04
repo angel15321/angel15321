@@ -32,6 +32,7 @@ SPORT_KINDS = {
     "nfl": {"football_team_full_game_winner": "ml", "football_team_full_game_spread": "spread"},
     "nba": {"basketball_team_full_game_winner": "ml", "basketball_team_full_game_spread": "spread",
             "basketball_team_full_game_total": "total"},
+    "nhl": {"hockey_team_full_game_winner": "ml"},     # winner only (see kalshi.SPORT_SERIES)
 }
 KINDS = SPORT_KINDS["nfl"]
 EVENT_TTL = 600          # seconds to cache each game's market list (lines rarely change)

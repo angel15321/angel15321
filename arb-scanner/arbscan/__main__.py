@@ -60,7 +60,9 @@ def cmd_run(a):
         cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports,
         legs=a.legs, max_book_age=a.max_book_age, trigger=a.trigger, event_gap=a.event_gap_ms / 1000,
         confirm_s=a.confirm_ms / 1000, stale_pm=a.stale_pm, hedge_max_loss=a.hedge_max_loss,
-        maker=a.maker, maker_edge=a.maker_edge_c / 100, maker_ttl=a.maker_ttl, maker_in_play=a.maker_in_play,
+        maker=a.maker, maker_edge=a.maker_edge_c / 100, maker_ttl=a.maker_ttl,
+        maker_in_play=(tuple(a.sports) if a.maker_in_play == "all" else a.maker_in_play or ()),
+        maker_live_edge=a.maker_live_edge_c / 100, maker_live_quotes=a.maker_live_quotes,
         maker_horizon_h=a.maker_horizon_h, maker_max_qty=a.maker_max_qty, maker_quotes=a.maker_quotes)
     log = _log_to(a.log)
     try:
@@ -89,7 +91,10 @@ def cmd_run(a):
            if cfg.trigger == "event" else f" · trigger: scan every {max(1.0, a.interval):g}s")
         + f" · sports: {', '.join(cfg.sports)}"
         + (f" · MAKER: up to {cfg.maker_quotes} post-only Polymarket bids (1/game), edge >= {cfg.maker_edge * 100:.1f} c/pair, hedge on Kalshi, "
-           f"{'pre-game + in-play' if cfg.maker_in_play else 'pre-game only'} (<= {cfg.maker_horizon_h:g} h), "
+           f"pre-game (<= {cfg.maker_horizon_h:g} h)"
+           + (f" + IN-PLAY {', '.join(cfg.maker_in_play)} (edge >= {cfg.maker_live_edge * 100:.1f} c/pair, <= "
+              f"{cfg.maker_live_quotes} live quotes, pulled on any Kalshi tick against the hedge)" if cfg.maker_in_play else "")
+           + ", "
            f"re-price by modify <= every {cfg.maker_reprice:g}s, refresh {cfg.maker_ttl:g}s; taker arbs OFF" if cfg.maker else ""))
     if not _attach_feed(log) and cfg.live:
         sys.exit("Live trading needs the Polymarket US websocket (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY): "
@@ -177,7 +182,7 @@ def cmd_fees(a):
         print(f"{pr * 100:5.0f}¢ {kf:11.2f} {kp * 100:5.2f}% {pf:9.2f} {pp * 100:5.2f}% {be:14.2f}¢")
 
 
-SPORTS = ("nfl", "nba", "tennis")
+SPORTS = ("nfl", "nba", "nhl", "tennis")
 
 
 def _sports(text: str) -> tuple[str, ...]:
@@ -239,7 +244,14 @@ def main(argv=None):
     r.add_argument("--maker-edge-c", type=float, default=1.0,
                    help="maker: cents per pair the quote must make after both venues' fees (default 1)")
     r.add_argument("--maker-ttl", type=float, default=120, help="maker: re-price a quote after this many seconds (default 120)")
-    r.add_argument("--maker-in-play", action="store_true", help="maker: also quote games in progress (riskier: news moves first)")
+    r.add_argument("--maker-in-play", nargs="?", const="all", default=None,
+                   type=lambda t: t if t == "all" else _sports(t),
+                   help="maker: also quote games in progress -- a comma list of sports (e.g. nhl,tennis,nba,nfl), or "
+                        "no value for every --sports. Riskier: news moves Kalshi before a Polymarket cancel lands")
+    r.add_argument("--maker-live-edge-c", type=float, default=4.0,
+                   help="maker: cents per pair a quote on a game in progress must make after fees (default 4)")
+    r.add_argument("--maker-live-quotes", type=int, default=2,
+                   help="maker: at most this many of the quote slots on games in progress (default 2)")
     r.add_argument("--maker-horizon-h", type=float, default=24, help="maker: quote games starting within N hours (default 24)")
     r.add_argument("--maker-quotes", type=int, default=3,
                    help="maker: quotes resting at once, one per game; the day's room is split across them (default 3)")
@@ -257,7 +269,7 @@ def main(argv=None):
     r.add_argument("--kalshi-demo", action="store_true", help="send Kalshi orders to the demo exchange")
     r.add_argument("--once", action="store_true", help="single scan then exit")
     r.add_argument("--sports", type=_sports, default=("nfl",),
-                   help="comma list: nfl (moneylines + spreads), nba (moneylines + spreads + totals), tennis (ATP/WTA/Challenger match winners); default nfl")
+                   help="comma list: nfl (moneylines + spreads), nba (moneylines + spreads + totals), nhl (moneylines), tennis (ATP/WTA/Challenger match winners); default nfl")
     r.set_defaults(fn=cmd_run)
 
     c = sub.add_parser("check", help="verify API keys and show balances")

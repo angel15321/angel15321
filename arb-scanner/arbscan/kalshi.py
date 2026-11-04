@@ -14,6 +14,9 @@ API = "https://api.elections.kalshi.com/trade-api/v2"
 SPORT_SERIES = {
     "nfl": {"KXNFLGAME": "ml", "KXNFLSPREAD": "spread", "KXNFLTOTAL": "total"},
     "nba": {"KXNBAGAME": "ml", "KXNBASPREAD": "spread", "KXNBATOTAL": "total"},
+    # NHL: moneyline only. A shootout adds a goal to the final score, and whether each venue's puck line / total
+    # counts it is not checked, so only the winner market (OT and shootout included on both) is paired.
+    "nhl": {"KXNHLGAME": "ml"},
 }
 SERIES = SPORT_SERIES["nfl"]
 VENUE = "Kalshi"
