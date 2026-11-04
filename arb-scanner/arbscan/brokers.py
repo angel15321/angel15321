@@ -156,7 +156,15 @@ class PaperBroker:
             if book.best_ask is not None and book.best_ask <= q["price"] + 1e-9:
                 q.update(state="filled", cum=q["qty"])
                 self.cash -= q["qty"] * q["price"]
-        return {"state": q["state"], "done": q["state"] != "resting", "cum": q["cum"], "avg": q["price"], "fee": 0.0}
+        return {"state": q["state"], "done": q["state"] != "resting", "cum": q["cum"], "avg": q["price"], "fee": 0.0,
+                "price": q["price"]}
+
+    def modify(self, c: Contract, oid: str, limit: float, qty: float) -> tuple[bool, str]:
+        q = getattr(self, "quotes", {}).get(oid)
+        if q is None or q["state"] != "resting":
+            return False, "not resting"
+        q.update(price=limit, qty=qty)
+        return True, ""
 
     def cancel(self, c: Contract, oid: str) -> dict:
         st = self.order_state(c, oid)
@@ -427,8 +435,23 @@ class PolymarketBroker:
         avg_yes = float((o.get("avgPx") or {}).get("value") or 0)
         avg = (avg_yes if c.ref["side"] == "long" else 1 - avg_yes) if cum else 0.0
         fee_v = (o.get("commissionNotionalTotalCollected") or {}).get("value")
+        px = (o.get("price") or {}).get("value")
+        price = None if px in (None, "") else (float(px) if c.ref["side"] == "long" else round(1 - float(px), 4))
         return {"state": o.get("state", ""), "done": o.get("state") in self.done, "cum": cum, "avg": avg,
-                "fee": float(fee_v) if fee_v not in (None, "") else 0.0}
+                "fee": float(fee_v) if fee_v not in (None, "") else 0.0, "price": price}
+
+    def modify(self, c: Contract, oid: str, limit: float, qty: float) -> tuple[bool, str]:
+        """New price (our side's) for a resting quote, in place: POST /v1/order/{id}/modify (empty reply on success)."""
+        tick = c.tick or 0.01
+        yes_px = floor_to(limit, tick) if c.ref["side"] == "long" else ceil_to(1 - limit, tick)
+        yes_px = min(max(round(yes_px, 4), tick), 1 - tick)
+        body = {"marketSlug": c.ref["slug"], "price": {"value": f"{yes_px:.4f}", "currency": "USD"},
+                "quantity": floor_to(qty, 0.01), "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL", "participateDontInitiate": True}
+        try:
+            self._req("POST", f"/v1/order/{oid}/modify", body)
+        except Exception as e:
+            return False, str(e)[:300]
+        return True, ""
 
     def order_state(self, c: Contract, oid: str) -> dict:
         return self._state(c, self._req("GET", f"/v1/order/{oid}").get("order") or {})

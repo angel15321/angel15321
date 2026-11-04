@@ -163,7 +163,7 @@ class ChurnTests(Base):
         for x in (pm2, k2):
             x.ref["ticker"] += "-2"
             x.ref["slug"] = x.ref.get("slug", "") + "-2"
-        maker.STATE.quote.posted_at -= 10
+        maker.STATE.quote.priced_at -= 10
         maker.step(self.db, self.cfg, self.paper, [other], full=False, **QUIET)   # event path, our game not in view
         self.assertEqual(maker.STATE.quote.oid, oid)
 
@@ -171,12 +171,28 @@ class ChurnTests(Base):
         g, pm, k = pair()
         maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
         pm.book.bids = [(0.40, 50)]                               # someone bid over our 0.39
-        maker.STATE.quote.posted_at -= 10
+        maker.STATE.quote.priced_at -= 10
         maker.STATE.last_post -= 10
         logs = []
         maker.step(self.db, self.cfg, self.paper, [g], log=logs.append, full=True)
         self.assertAlmostEqual(maker.STATE.quote.price, 0.41)
-        self.assertTrue(any("re-price to Under 44.5 @ 0.41" in x for x in logs))
+        self.assertTrue(any("re-priced KC @ DEN Under 44.5 0.39 -> 0.41 (modify)" in x for x in logs))
+        self.assertEqual(self.paper["Polymarket"].quotes[maker.STATE.quote.oid]["price"], 0.41)   # same order id
+        self.assertEqual(self.db.execute("SELECT price FROM quotes").fetchone()[0], 0.41)
+
+    def test_modify_that_does_not_take_falls_back_to_cancel_and_post(self):
+        g, pm, k = pair()
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        old = maker.STATE.quote.oid
+        self.paper["Polymarket"].modify = lambda *a, **kw: (False, "HTTP 400: bad modify")
+        pm.book.bids = [(0.40, 50)]
+        maker.STATE.quote.priced_at -= 10
+        logs = []
+        maker.step(self.db, self.cfg, self.paper, [g], log=logs.append, full=True)
+        self.assertFalse(maker.STATE.modify_ok)
+        self.assertNotEqual(maker.STATE.quote.oid, old)                 # a fresh order at the new price
+        self.assertAlmostEqual(maker.STATE.quote.price, 0.41)
+        self.assertTrue(any("modify did not take" in x for x in logs))
 
     def test_polymarket_live_flag_pulls(self):
         g, pm, k = pair()
@@ -184,6 +200,52 @@ class ChurnTests(Base):
         pm.ref["live"] = True
         maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
         self.assertIsNone(maker.STATE.quote)
+
+
+def second_game(away="LV"):
+    g, pm, k = pair(pm_bids=[(0.30, 10)], pm_asks=[(0.60, 10)])
+    g.away = away
+    for x in (pm, k):
+        x.ref["ticker"] += "-" + away
+        if "slug" in x.ref:
+            x.ref["slug"] += "-" + away
+    return g, pm, k
+
+
+class MultiQuoteTests(Base):
+    def test_one_quote_per_game_up_to_the_slots(self):
+        g1, _, _ = pair()
+        g2, _, _ = second_game("LV")
+        g3, _, _ = second_game("SEA")
+        g4, _, _ = second_game("SF")
+        for _ in range(6):
+            maker.STATE.last_post = 0
+            maker.step(self.db, self.cfg, self.paper, [g1, g2, g3, g4], full=True, **QUIET)
+        qs = list(maker.STATE.quotes.values())
+        self.assertEqual(len(qs), 3)
+        self.assertEqual(len({q.game_key for q in qs}), 3)
+
+    def test_day_room_is_split_across_slots(self):
+        cfg = trader.Config(maker=True, max_per_trade=20, max_daily_spend=12, min_profit=0.0)
+        g1, _, _ = pair()
+        g2, _, _ = second_game("LV")
+        for _ in range(3):
+            maker.STATE.last_post = 0
+            maker.step(self.db, cfg, self.paper, [g1, g2], full=True, **QUIET)
+        qs = list(maker.STATE.quotes.values())
+        self.assertEqual(len(qs), 2)
+        self.assertLessEqual(sum(q.outlay() for q in qs), 12 + 1e-6)   # all filling at once still fits the day cap
+
+    def test_shutdown_pulls_every_quote(self):
+        g1, _, _ = pair()
+        g2, _, _ = second_game("LV")
+        for _ in range(3):
+            maker.STATE.last_post = 0
+            maker.step(self.db, self.cfg, self.paper, [g1, g2], full=True, **QUIET)
+        self.assertEqual(len(maker.STATE.quotes), 2)
+        maker.shutdown(self.db, self.cfg, self.paper, **QUIET)
+        self.assertEqual(maker.STATE.quotes, {})
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM quotes WHERE closed_at IS NULL").fetchone()[0], 0)
 
 
 class RecoverTests(Base):
@@ -229,6 +291,15 @@ class PolymarketBrokerMakerTests(unittest.TestCase):
         self.assertTrue(sent["participateDontInitiate"])
         self.assertEqual(sent["intent"], "ORDER_INTENT_BUY_SHORT")
         self.assertEqual(sent["price"]["value"], "0.6100")    # a short bought at 0.39 = YES at 0.61
+
+    def test_modify_sends_the_yes_price_in_place(self):
+        sent = {}
+        with mock.patch.object(self.b, "_req", side_effect=lambda m, p, body=None: sent.update(path=p, **(body or {})) or {}):
+            ok, err = self.b.modify(self.pm, "o1", 0.41, 20)
+        self.assertTrue(ok)
+        self.assertEqual(sent["path"], "/v1/order/o1/modify")
+        self.assertEqual(sent["price"]["value"], "0.5900")
+        self.assertTrue(sent["participateDontInitiate"])
 
     def test_cancel_reads_the_fill(self):
         replies = iter([{}, {"order": {"state": "ORDER_STATE_CANCELED", "cumQuantity": "5", "avgPx": {"value": "0.61"}}}])

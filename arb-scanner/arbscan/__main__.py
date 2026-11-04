@@ -61,7 +61,7 @@ def cmd_run(a):
         legs=a.legs, max_book_age=a.max_book_age, trigger=a.trigger, event_gap=a.event_gap_ms / 1000,
         confirm_s=a.confirm_ms / 1000, stale_pm=a.stale_pm, hedge_max_loss=a.hedge_max_loss,
         maker=a.maker, maker_edge=a.maker_edge_c / 100, maker_ttl=a.maker_ttl, maker_in_play=a.maker_in_play,
-        maker_horizon_h=a.maker_horizon_h, maker_max_qty=a.maker_max_qty)
+        maker_horizon_h=a.maker_horizon_h, maker_max_qty=a.maker_max_qty, maker_quotes=a.maker_quotes)
     log = _log_to(a.log)
     try:
         brokers = trader.make_brokers(cfg, kalshi_demo=a.kalshi_demo)
@@ -88,9 +88,9 @@ def cmd_run(a):
         + (f" · trigger: every book change (confirm {cfg.confirm_s * 1000:.0f} ms, per game <= 1/{cfg.event_gap * 1000:.0f} ms)"
            if cfg.trigger == "event" else f" · trigger: scan every {max(1.0, a.interval):g}s")
         + f" · sports: {', '.join(cfg.sports)}"
-        + (f" · MAKER: post-only Polymarket bids, edge >= {cfg.maker_edge * 100:.1f} c/pair, hedge on Kalshi, "
+        + (f" · MAKER: up to {cfg.maker_quotes} post-only Polymarket bids (1/game), edge >= {cfg.maker_edge * 100:.1f} c/pair, hedge on Kalshi, "
            f"{'pre-game + in-play' if cfg.maker_in_play else 'pre-game only'} (<= {cfg.maker_horizon_h:g} h), "
-           f"re-price <= every {cfg.maker_reprice:g}s, refresh {cfg.maker_ttl:g}s; taker arbs OFF" if cfg.maker else ""))
+           f"re-price by modify <= every {cfg.maker_reprice:g}s, refresh {cfg.maker_ttl:g}s; taker arbs OFF" if cfg.maker else ""))
     if not _attach_feed(log) and cfg.live:
         sys.exit("Live trading needs the Polymarket US websocket (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY): "
                  "the REST books lag the exchange by 10-30 s.")
@@ -241,6 +241,8 @@ def main(argv=None):
     r.add_argument("--maker-ttl", type=float, default=120, help="maker: re-price a quote after this many seconds (default 120)")
     r.add_argument("--maker-in-play", action="store_true", help="maker: also quote games in progress (riskier: news moves first)")
     r.add_argument("--maker-horizon-h", type=float, default=24, help="maker: quote games starting within N hours (default 24)")
+    r.add_argument("--maker-quotes", type=int, default=3,
+                   help="maker: quotes resting at once, one per game; the day's room is split across them (default 3)")
     r.add_argument("--maker-max-qty", type=float, default=0, help="maker: contracts per quote cap (default 0 = $ caps only)")
     r.add_argument("--max-book-age", type=float, default=1.0,
                    help="skip an arb priced from a Kalshi book older than this many seconds (default 1.0); Polymarket books are re-read from the live feed right before pricing")

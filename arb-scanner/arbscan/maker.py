@@ -1,22 +1,25 @@
-"""Maker mode: rest a bid on Polymarket US priced off Kalshi's live ask, hedge on Kalshi the moment it fills.
+"""Maker mode: rest bids on Polymarket US priced off Kalshi's live ask, hedge on Kalshi the moment one fills.
 
 Why: as a taker the bot lost every race (11-02/03: 50 attempts, 0 hedged). The quotes it chased were pulled
 before even a 10 ms Kalshi order landed. A maker does not race for the fill: the other side comes to it.
 
-One quote at a time:
+Up to cfg.maker_quotes quotes at once, at most one per game (a game's news would hit them all together):
 1. For every cross-venue pair (a Polymarket contract + the Kalshi contract that covers the other outcomes)
    the most we may pay on Polymarket is  guaranteed - (Kalshi ask + Kalshi taker fee) - maker_edge.
-   Polymarket makers pay no fee. The quote goes one tick over the best Polymarket bid (our own excluded),
-   never above that ceiling, never at or above the Polymarket ask (post-only: the exchange rejects a
-   crossing quote instead of taking).
-2. The quote is PULLED whenever it is no longer safe: the Kalshi ask it is priced from got worse or thinner,
-   either feed stopped, the game started (pre-game mode), or it outlived maker_ttl. A better price is a
-   cancel + re-post, at most every maker_reprice seconds.
-3. A fill (private order stream, REST poll as backup): Kalshi hedge IOC at once for the whole contracts
+   Polymarket makers pay no fee. A quote goes one tick over the best Polymarket bid (our own excluded),
+   never above that ceiling, never at or above the Polymarket ask (participateDontInitiate: the exchange
+   rejects a crossing quote instead of taking).
+2. A quote is PULLED whenever it is no longer safe: the Kalshi ask it is priced from got worse or thinner,
+   either feed stopped, the game started (schedule or Polymarket's live flag), or it outlived maker_ttl.
+   A new price for the SAME pair is one modify call (no gap with nothing resting, one round trip instead of
+   cancel + post); a different pair is a cancel + post. At most one re-price per quote per maker_reprice s.
+3. Size: the day's remaining room (and cash) is split across the quote slots, so if every quote filled at
+   once the total still fits the daily cap.
+4. A fill (private order stream, REST poll as backup): Kalshi hedge IOC at once for the whole contracts
    filled, then cancel the rest, then the normal hedge retries / sell-back-or-hold rule (trader._after_leg1).
-4. Every quote is written to the `quotes` table before it is sent; quotes left open by a crash are
+5. Every quote is written to the `quotes` table before it is sent; quotes left open by a crash are
    cancelled at the next start, and one that filled meanwhile is booked as an `error` row (halts the bot).
-   On any exit (kill file, halt, Ctrl-C, SIGTERM) the resting quote is cancelled.
+   On any exit (kill file, halt, Ctrl-C, SIGTERM) every resting quote is cancelled.
 
 The risk is the known one: a resting quote is a free option, and the fills we least want come when news
 moves Kalshi before we pull it (Polymarket's cancel takes 85-385 ms). Pre-game only by default, small size,
@@ -44,6 +47,7 @@ CREATE TABLE IF NOT EXISTS quotes (
   filled REAL, note TEXT
 );
 """
+MODIFY_CHECKS = 3        # the first modifies of a run are read back to confirm the new price took
 
 
 def connect(db) -> None:
@@ -62,20 +66,33 @@ class Quote:
     qty: float
     k_ask: float             # Kalshi ask the quote was priced from
     guaranteed: float
-    posted_at: float
+    posted_at: float         # first posted (maker_ttl counts from here)
+    priced_at: float = 0.0   # last post or modify (maker_reprice counts from here)
     polled_at: float = 0.0
     pm: Contract | None = None   # latest contract objects (books are refreshed every scan / event)
     k: Contract | None = None
     game: object = None
 
+    def outlay(self) -> float:
+        fee = self.k.fee.per_contract(self.k_ask) if self.k is not None else 0.0
+        return self.qty * (self.price + self.k_ask + fee)
+
 
 @dataclass
 class State:
-    quote: Quote | None = None
+    quotes: dict = field(default_factory=dict)     # order id -> Quote
     last_post: float = 0.0
     rejects: int = 0
     paused: str = ""
-    stats: dict = field(default_factory=lambda: {"quotable": 0, "posted": 0, "pulled": 0, "repriced": 0, "fills": 0})
+    modify_ok: bool = True    # False after a modify that did not take: re-price by cancel + post this run
+    modify_checks: int = 0
+    stats: dict = field(default_factory=lambda: {"quotable": 0, "posted": 0, "pulled": 0, "repriced": 0,
+                                                 "modified": 0, "fills": 0})
+
+    @property
+    def quote(self) -> Quote | None:
+        """The one resting quote when there is exactly one (tests, the 1-slot setup)."""
+        return next(iter(self.quotes.values())) if len(self.quotes) == 1 else None
 
 
 STATE = State()
@@ -88,10 +105,12 @@ def reset() -> None:
 
 # ---------------------------------------------------------------- pricing
 
-def own_free_bid(c: Contract, q: Quote | None) -> float | None:
-    """Best Polymarket bid on c with our own resting quote taken out (else we would outbid ourselves)."""
+def own_free_bid(c: Contract, own: dict) -> float | None:
+    """Best Polymarket bid on c with our own resting quote taken out (else we would outbid ourselves).
+    `own` = {pm contract id: Quote}."""
+    q = own.get(c.id) if own else None
     for p, s in c.book.bids:
-        if q is not None and q.pm_id == c.id and abs(p - q.price) < 1e-6:
+        if q is not None and abs(p - q.price) < 1e-6:
             s -= q.qty
         if s > 1e-9:
             return p
@@ -117,8 +136,11 @@ class Cand:
         return self.edge * self.qty
 
 
-def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own: Quote | None) -> Cand | None:
-    """The quote for one pair, or None when it cannot be quoted at the top of the Polymarket book."""
+def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own) -> Cand | None:
+    """The quote for one pair, or None when it cannot be quoted at the top of the Polymarket book.
+    `own` = {pm contract id: Quote} (or one Quote / None)."""
+    if isinstance(own, Quote):
+        own = {own.pm_id: own}
     a, b = (pm, k) if pm.side == "gt" else (k, pm)
     if b.line < a.line:
         return None
@@ -131,7 +153,7 @@ def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own: Quote | No
     unit_k = ka + k.fee.per_contract(ka)
     tick = pm.tick or 0.01
     ceiling = floor_to(guaranteed - unit_k - cfg.maker_edge + 1e-9, tick)
-    bid = own_free_bid(pm, own)
+    bid = own_free_bid(pm, own or {})
     ask = pm.book.best_ask
     price = ceiling if bid is None else min(ceiling, round(bid + tick, 4))
     if ask is not None:
@@ -150,7 +172,9 @@ def price_pair(cfg, g, pm: Contract, k: Contract, budget: float, own: Quote | No
     return Cand(f"{a.id}|{b.id}", g, pm, k, pm is a, guaranteed, middle, price, qty, ka, edge)
 
 
-def candidates(cfg, games, budget: float, own: Quote | None) -> list[Cand]:
+def candidates(cfg, games, budget: float, own) -> list[Cand]:
+    if isinstance(own, Quote):
+        own = {own.pm_id: own}
     out = []
     for g in games:
         pms = [c for c in g.contracts if c.venue == "Polymarket"]
@@ -173,23 +197,24 @@ def _snap(c: Contract) -> str:
                        "side": c.side, "line": c.line, "tie_half": c.tie_half, "fee_rate": c.fee.rate})
 
 
-def _budget(db, cfg, brokers, k: Contract | None, log) -> float:
+def _room(db, cfg, brokers, log) -> tuple[float, float, dict | None, float]:
+    """(day/open room $, Polymarket pot $, Kalshi shard pots or None, Kalshi pot $) -- before any resting quote."""
     from . import trader
     mode = "live" if cfg.live else "dry"
-    room_day = cfg.max_daily_spend - trader.spent_today(db, mode)
-    room_open = cfg.max_open - trader.open_exposure(db, mode)
+    room = min(cfg.max_daily_spend - trader.spent_today(db, mode), cfg.max_open - trader.open_exposure(db, mode))
     try:
         cash = trader.balances(brokers)
     except Exception as e:
         log(f"! maker: balance check failed: {e}")
-        return 0.0
-    pm_pot = cash.get("Polymarket", 0.0) * 0.95
-    k_pot = cash.get("Kalshi", 0.0) * 0.95
+        return 0.0, 0.0, None, 0.0
     shards = getattr(brokers.get("Kalshi"), "shards", None)
-    if k is not None and shards is not None and k.ref.get("shard") is not None:
-        k_pot = shards.get(int(k.ref["shard"]), 0.0) * 0.95
-    # the pair's outlay is split across the venues; the smaller pot caps roughly half of it
-    return max(0.0, min(cfg.max_per_trade, room_day, room_open, 2 * min(pm_pot, k_pot)))
+    return max(0.0, room), cash.get("Polymarket", 0.0) * 0.95, shards, cash.get("Kalshi", 0.0) * 0.95
+
+
+def _k_pot(k: Contract, shards, k_all: float) -> float:
+    if shards is not None and k.ref.get("shard") is not None:
+        return shards.get(int(k.ref["shard"]), 0.0) * 0.95
+    return k_all
 
 
 def _feeds_ok() -> bool:
@@ -206,53 +231,95 @@ def step(db, cfg, brokers, games, log, full: bool = False):
     """Called with freshly refreshed books for `games` (a full scan, or the games an event touched)."""
     s = STATE
     now, now_dt = time.time(), dt.datetime.now(dt.timezone.utc)
-    q = s.quote
     by_id = {c.id: (g, c) for g in games for c in g.contracts}
-    if q is not None:
+    in_view = {g.key for g in games}
+    for q in list(s.quotes.values()):
         if q.pm_id in by_id and q.k_id in by_id:
             q.game, q.pm = by_id[q.pm_id]
             q.k = by_id[q.k_id][1]
         if q.pm is not None and (q.pm_id in by_id or full):
             why = _unsafe(cfg, q, q.pm_id in by_id, now, now_dt)
-            if why:
-                return pull(db, cfg, brokers, why, log)
+            if why and pull(db, cfg, brokers, q, why, log) == "halt":
+                return "halt"
     if s.paused:
         return None
     ok = [g for g in games if _pregame(g, now_dt) or cfg.maker_in_play]
     if not ok or not _feeds_ok():
         return None
     from . import trader
-    budget = _budget(db, cfg, brokers, None, log)
-    if budget < 2:
+    room, pm_pot, shards, k_all = _room(db, cfg, brokers, log)
+    slots = max(1, cfg.maker_quotes)
+    per = min(cfg.max_per_trade, room / slots, pm_pot / slots)
+    if per < 2:
         return None
-    cands = [c for c in candidates(cfg, ok, budget, q)
-             if all(now - x.book.fetched_at <= cfg.max_book_age for x in (c.k,))
+    own = {q.pm_id: q for q in s.quotes.values()}
+    cands = [c for c in candidates(cfg, ok, per, own)
+             if now - c.k.book.fetched_at <= cfg.max_book_age
              and not trader.recently_taken(db, c.key, cfg.cooldown_min)]
     if full:
         s.stats["quotable"] = max(s.stats["quotable"], len(cands))
-    best = cands[0] if cands else None
-    if q is not None:
-        if not full and q.game_key not in {g.key for g in games}:
-            return None            # an event on another game: no view of our own quote's pair to compare with
-        cur = next((c for c in cands if c.key == q.key), None)
-        if cur is not None and abs(cur.price - q.price) < 1e-6 and best.score <= cur.score * 1.5:
-            return None            # our quote is still the right one (a small gain is not worth a re-post)
-        if now - q.posted_at < cfg.maker_reprice:
+    by_key = {}
+    for c in cands:
+        by_key.setdefault(c.key, c)
+
+    # 1. our quotes in view: keep, re-price (same pair), or pull
+    for q in list(s.quotes.values()):
+        if q.game_key not in in_view or now - q.priced_at < cfg.maker_reprice:
+            continue
+        cur = by_key.get(q.key)
+        if cur is None:
+            if pull(db, cfg, brokers, q, "no longer quotable at the top of the book", log) == "halt":
+                return "halt"
+        elif abs(cur.price - q.price) > 1e-6:
+            if reprice(db, cfg, brokers, q, cur, log) == "halt":
+                return "halt"
+
+    # 2. room shrank (a fill booked spend): the newest quotes go until the rest fit. 15% slack so a re-price a
+    #    tick or two up does not pull-and-re-post a quote every second (box paper run 11-04 01:46Z)
+    committed = sum(q.outlay() for q in s.quotes.values())
+    for q in sorted(s.quotes.values(), key=lambda x: -x.posted_at):
+        if committed <= room * 1.15 + 0.01:
+            break
+        committed -= q.outlay()
+        if pull(db, cfg, brokers, q, f"day room ${room:.2f} no longer covers every resting quote", log) == "halt":
+            return "halt"
+
+    # 3. an empty slot takes the best pair of a game we are not quoting yet (one new post per step)
+    if now - s.last_post < cfg.maker_reprice / max(1, slots):
+        return None
+    games_used = {q.game_key for q in s.quotes.values()}
+    ks_used = {q.k_id for q in s.quotes.values()}
+    free = [c for c in cands if c.game.key not in games_used and c.k.id not in ks_used and c.key not in
+            {q.key for q in s.quotes.values()}]
+    if not free:
+        return None
+    best = free[0]
+    if len(s.quotes) >= slots:
+        # full: swap out the weakest quote only for a clearly better pair, and only one older than maker_reprice
+        def score(q):
+            c = by_key.get(q.key)
+            return c.score if c is not None else 0.0
+        weak = min(s.quotes.values(), key=score)
+        if weak.game_key not in in_view or best.score <= score(weak) * 1.5 or now - weak.priced_at < cfg.maker_reprice:
             return None
-        if cur is not None and best.score <= cur.score * 1.5:
-            best = cur             # same pair at its new price
-        why = ("no longer quotable at the top of the book" if best is None
-               else f"re-price to {best.pm.label} @ {best.price:.2f}")
-        s.stats["repriced"] += best is not None
-        r = pull(db, cfg, brokers, why, log)
-        if r == "halt" or s.quote is not None:
-            return r
+        s.stats["repriced"] += 1
+        if pull(db, cfg, brokers, weak, f"swapped for {best.game.title} {best.pm.label} @ {best.price:.2f}", log) == "halt":
+            return "halt"
+        if weak.oid in s.quotes:
+            return None
+    # a new quote is sized from the room the resting ones leave, split over the free slots
+    committed = sum(q.outlay() for q in s.quotes.values())
+    free_slots = max(1, slots - len(s.quotes))
+    per_new = min(cfg.max_per_trade, (room - committed) / free_slots, pm_pot / slots)
+    if per_new < 2:
+        return None
+    best = price_pair(cfg, best.game, best.pm, best.k, per_new, own)
     if best is None:
         return None
-    if now - s.last_post < cfg.maker_reprice:
-        return None
-    k_budget = _budget(db, cfg, brokers, best.k, log)
-    if k_budget < best.qty * (best.price + best.k_ask + best.k.fee.per_contract(best.k_ask)) - 1e-9:
+    k_pot = _k_pot(best.k, shards, k_all) - sum(q.qty * (q.k_ask + q.k.fee.per_contract(q.k_ask))
+                                                for q in s.quotes.values() if q.k is not None and
+                                                q.k.ref.get("shard") == best.k.ref.get("shard"))
+    if k_pot < best.qty * (best.k_ask + best.k.fee.per_contract(best.k_ask)) - 1e-9:
         return None
     return post(db, cfg, brokers, best, log)
 
@@ -301,11 +368,48 @@ def post(db, cfg, brokers, c: Cand, log):
                (f.order_id, mode, now, c.game.title, c.game.start.isoformat() if c.game.start else None, c.key,
                 _snap(c.pm), _snap(c.k), c.price, c.qty, c.k_ask, c.guaranteed))
     db.commit()
-    s.quote = Quote(f.order_id, c.key, c.pm.id, c.k.id, c.game.key, c.game.title, c.price, c.qty, c.k_ask,
-                    c.guaranteed, now, now, c.pm, c.k, c.game)
+    s.quotes[f.order_id] = Quote(f.order_id, c.key, c.pm.id, c.k.id, c.game.key, c.game.title, c.price, c.qty,
+                                 c.k_ask, c.guaranteed, now, now, now, c.pm, c.k, c.game)
     s.stats["posted"] += 1
     log(f"  ◷ QUOTE {c.game.title}: bid {c.pm.label} @ {c.price:.2f} x{c.qty:g} on Polymarket; hedge "
-        f"{c.k.label} @ {c.k_ask:.2f} on Kalshi; edge {c.edge * 100:.1f} c/pair after fees")
+        f"{c.k.label} @ {c.k_ask:.2f} on Kalshi; edge {c.edge * 100:.1f} c/pair after fees "
+        f"[{len(s.quotes)}/{max(1, cfg.maker_quotes)} resting]")
+    return None
+
+
+def reprice(db, cfg, brokers, q: Quote, c: Cand, log):
+    """New price for the same pair: modify in place (quantity kept); cancel + post when modify is not usable."""
+    s = STATE
+    if not s.modify_ok:
+        s.stats["repriced"] += 1
+        r = pull(db, cfg, brokers, q, f"re-price to {c.price:.2f}", log)
+        if r == "halt" or q.oid in s.quotes:
+            return r
+        return post(db, cfg, brokers, c, log)
+    b = brokers["Polymarket"]
+    ok, err = b.modify(q.pm, q.oid, c.price, q.qty)
+    now = time.time()
+    if ok and s.modify_checks < MODIFY_CHECKS:
+        # read the order back: the reply is empty on success, so the first few are confirmed from the order itself
+        s.modify_checks += 1
+        try:
+            st = b.order_state(q.pm, q.oid)
+            if st.get("cum"):
+                return _filled(db, cfg, brokers, q, st, log)
+            if st.get("done") or abs((st.get("price") or c.price) - c.price) > 1e-6:
+                ok, err = False, f"order reads {st.get('state')} @ {st.get('price')} after the modify"
+        except Exception as e:
+            ok, err = False, f"read-back failed: {e}"
+    if not ok:
+        s.modify_ok = False
+        log(f"  ! modify did not take ({q.title} {q.oid}): {err} -- re-pricing by cancel + post from now on")
+        return reprice(db, cfg, brokers, q, c, log)
+    old = q.price
+    q.price, q.k_ask, q.priced_at = c.price, c.k_ask, now
+    db.execute("UPDATE quotes SET price=?, k_ask=? WHERE order_id=?", (q.price, q.k_ask, q.oid))
+    db.commit()
+    s.stats["modified"] += 1
+    log(f"  ↔ re-priced {q.title} {q.pm.label} {old:.2f} -> {c.price:.2f} (modify)")
     return None
 
 
@@ -321,11 +425,10 @@ def _cancel(brokers, c: Contract, oid: str) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def pull(db, cfg, brokers, why: str, log):
-    """Cancel the resting quote; a fill that happened meanwhile is hedged."""
+def pull(db, cfg, brokers, q: Quote, why: str, log):
+    """Cancel one resting quote; a fill that happened meanwhile is hedged."""
     s = STATE
-    q = s.quote
-    if q is None:
+    if q.oid not in s.quotes:
         return None
     st = _cancel(brokers, q.pm, q.oid)
     if st.get("error") or not st.get("done"):
@@ -334,7 +437,7 @@ def pull(db, cfg, brokers, why: str, log):
             return None                         # still ours, still resting: the next step tries again
     if st.get("cum"):
         return _filled(db, cfg, brokers, q, st, log, cancelled=True)
-    s.quote = None
+    s.quotes.pop(q.oid, None)
     s.stats["pulled"] += 1
     _close_row(db, q.oid, 0.0, f"pulled: {why}")
     log(f"  ✕ pulled {q.title} {q.pm.label} @ {q.price:.2f}: {why}")
@@ -342,31 +445,28 @@ def pull(db, cfg, brokers, why: str, log):
 
 
 def poll(db, cfg, brokers, log, force: bool = False):
-    """Fill check: the private order stream when it has the order, else a REST read every maker_poll s."""
+    """Fill check per quote: the private order stream when it has the order, else a REST read every maker_poll s."""
     s = STATE
-    q = s.quote
-    if q is None:
-        return None
     now = time.time()
-    st = None
     feed = polymarket._orders
-    if feed is not None:
-        st = feed.state(q.oid, q.pm)
-    if (st is None or not st.get("cum")) and (force or now - q.polled_at >= cfg.maker_poll):
-        q.polled_at = now
-        try:
-            st = brokers["Polymarket"].order_state(q.pm, q.oid)
-        except Exception as e:
-            log(f"! maker: order read failed: {e}")
-            return None
-    if not st:
-        return None
-    if st.get("cum"):
-        return _filled(db, cfg, brokers, q, st, log)
-    if st.get("done"):                          # cancelled / expired by the exchange without a fill
-        s.quote = None
-        _close_row(db, q.oid, 0.0, f"closed by the exchange: {st.get('state')}")
-        log(f"  ✕ quote {q.title} closed by the exchange ({st.get('state')})")
+    for q in list(s.quotes.values()):
+        st = feed.state(q.oid, q.pm) if feed is not None else None
+        if (st is None or not st.get("cum")) and (force or now - q.polled_at >= cfg.maker_poll):
+            q.polled_at = now
+            try:
+                st = brokers["Polymarket"].order_state(q.pm, q.oid)
+            except Exception as e:
+                log(f"! maker: order read failed: {e}")
+                continue
+        if not st:
+            continue
+        if st.get("cum"):
+            if _filled(db, cfg, brokers, q, st, log) == "halt":
+                return "halt"
+        elif st.get("done"):                    # cancelled / expired by the exchange without a fill
+            s.quotes.pop(q.oid, None)
+            _close_row(db, q.oid, 0.0, f"closed by the exchange: {st.get('state')}")
+            log(f"  ✕ quote {q.title} closed by the exchange ({st.get('state')})")
     return None
 
 
@@ -374,6 +474,8 @@ def _filled(db, cfg, brokers, q: Quote, st: dict, log, cancelled: bool = False):
     """Hedge on Kalshi first (fast), then make sure the rest of the quote is gone, then the normal hedge path."""
     from . import trader
     s = STATE
+    if q.oid not in s.quotes:
+        return None
     s.stats["fills"] += 1
     mode = "live" if cfg.live else "dry"
     detected = time.time()
@@ -393,7 +495,7 @@ def _filled(db, cfg, brokers, q: Quote, st: dict, log, cancelled: bool = False):
         if fin.get("error") or not fin.get("done"):
             log(f"  ! quote {q.oid} cancel after fill not confirmed: {fin.get('error') or fin.get('state')} -- "
                 "check Polymarket for a resting order")
-    s.quote = None
+    s.quotes.pop(q.oid, None)
     a_is_pm = q.key.split("|")[0] == pm.id
     a, b = (pm, k) if a_is_pm else (k, pm)
     guaranteed, middle = engine.guaranteed_payout(a, b)
@@ -418,13 +520,13 @@ def _filled(db, cfg, brokers, q: Quote, st: dict, log, cancelled: bool = False):
 
 def shutdown(db, cfg, brokers, log) -> None:
     """Never leave a quote resting when the bot stops."""
-    if STATE.quote is not None:
+    for q in list(STATE.quotes.values()):
         try:
-            pull(db, cfg, brokers, "the bot is stopping", log)
+            pull(db, cfg, brokers, q, "the bot is stopping", log)
         except Exception as e:
-            log(f"! maker: could not cancel the resting quote {STATE.quote.oid} on exit: {e} -- CANCEL IT ON POLYMARKET")
-    if STATE.quote is not None:
-        log(f"! maker: quote {STATE.quote.oid} may still be resting on Polymarket -- check and cancel it")
+            log(f"! maker: could not cancel the resting quote {q.oid} on exit: {e} -- CANCEL IT ON POLYMARKET")
+    for q in STATE.quotes.values():
+        log(f"! maker: quote {q.oid} ({q.title}) may still be resting on Polymarket -- check and cancel it")
 
 
 def recover(db, cfg, brokers, log) -> int:
@@ -464,9 +566,11 @@ def recover(db, cfg, brokers, log) -> int:
 
 def stats_text() -> str:
     s = STATE.stats
-    q = STATE.quote
-    rest = f" · resting: {q.title} {q.pm.label} @ {q.price:.2f} x{q.qty:g}" if q is not None else " · nothing resting"
-    out = (f"  maker, last 60s: {s['quotable']} pairs quotable · {s['posted']} posted · {s['repriced']} re-priced · "
-           f"{s['pulled']} pulled · {s['fills']} filled{rest}" + (f" · PAUSED: {STATE.paused}" if STATE.paused else ""))
+    rest = "; ".join(f"{q.title} {q.pm.label} @ {q.price:.2f} x{q.qty:g}" for q in STATE.quotes.values() if q.pm)
+    out = (f"  maker, last 60s: {s['quotable']} pairs quotable · {s['posted']} posted · {s['modified']} re-priced by "
+           f"modify · {s['repriced']} swapped · {s['pulled']} pulled · {s['fills']} filled · "
+           f"resting {len(STATE.quotes)}" + (f": {rest}" if rest else "")
+           + (" · modify OFF (cancel + post)" if not STATE.modify_ok else "")
+           + (f" · PAUSED: {STATE.paused}" if STATE.paused else ""))
     STATE.stats = {k: 0 for k in s}
     return out

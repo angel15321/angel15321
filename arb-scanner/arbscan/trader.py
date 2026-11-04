@@ -123,6 +123,7 @@ class Config:
     maker_horizon_h: float = 24.0     # quote games starting within this many hours
     maker_max_qty: float = 0.0        # contracts per quote cap (0 = only the $ caps)
     maker_max_rejects: int = 3        # Polymarket refusing this many quotes in a row pauses maker mode
+    maker_quotes: int = 3             # quotes resting at once (one per game); the day room is split across them
 
 
 # ---------------------------------------------------------------- helpers
@@ -611,8 +612,8 @@ def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bo
             time.sleep(max(0.0, min(next_scan, time.time() + (cfg.maker_poll if cfg.maker else 1e9)) - time.time()))
             continue
         due = min([next_scan] + list(state["due"].values()))
-        if cfg.maker and maker.STATE.quote is not None:
-            due = min(due, maker.STATE.quote.polled_at + cfg.maker_poll)
+        if cfg.maker and maker.STATE.quotes:
+            due = min([due] + [q.polled_at + cfg.maker_poll for q in maker.STATE.quotes.values()])
         trig.event.wait(max(0.0, due - time.time()))
         try:
             if _on_events(db, cfg, brokers, state, trig.take(), log) == "halt":

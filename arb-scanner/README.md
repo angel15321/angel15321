@@ -58,8 +58,11 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
   tick over the best Polymarket bid (its own excluded), never above that ceiling and never at or above the
   ask (post-only: a crossing quote is rejected, not taken). `--maker-edge-c` (default 1¢ a pair).
 - **Pull:** the quote is cancelled when the Kalshi ask it is priced from gets worse or thinner, a feed
-  stops, the game starts (schedule or Polymarket's live flag), or after `--maker-ttl` (120 s). Re-posts at
-  most every 2 s. One quote at a time, sized by `--max-per-trade`.
+  stops, the game starts (schedule or Polymarket's live flag), or after `--maker-ttl` (120 s). A new price
+  for the same pair is one modify call (`POST /v1/order/{id}/modify`, no gap with nothing resting); the first
+  three are read back, and one that does not take switches the run to cancel + post.
+- **Several quotes:** up to `--maker-quotes` (3) at once, one per game. Each new quote is sized from the day's
+  room the resting ones leave, so if all of them filled together the total still fits `--max-daily`.
 - **Fill:** seen on the private order stream (REST poll every 1 s as backup), hedged on Kalshi at once, the
   rest of the quote cancelled, then the usual hedge retries and sell-back-or-hold rule.
 - **Safety:** every quote is written to the `quotes` table before it is sent; quotes a crash left open are
