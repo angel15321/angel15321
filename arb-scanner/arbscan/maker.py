@@ -90,6 +90,7 @@ class State:
     paused: str = ""
     modify_ok: bool = True    # False after a modify that did not take: re-price by cancel + post this run
     modify_checks: int = 0
+    modify_slow: int = 0      # slow modifies in a row (accepted, not applied within MODIFY_WAIT)
     stats: dict = field(default_factory=lambda: {"quotable": 0, "posted": 0, "pulled": 0, "repriced": 0,
                                                  "modified": 0, "fills": 0})
 
@@ -402,40 +403,60 @@ def post(db, cfg, brokers, c: Cand, log):
     return None
 
 
+def _repost(db, cfg, brokers, q: Quote, c: Cand, why: str, log):
+    STATE.stats["repriced"] += 1
+    r = pull(db, cfg, brokers, q, why, log)
+    if r == "halt" or q.oid in STATE.quotes:
+        return r
+    return post(db, cfg, brokers, c, log)
+
+
 def reprice(db, cfg, brokers, q: Quote, c: Cand, log):
-    """New price for the same pair: modify in place (quantity kept); cancel + post when modify is not usable."""
+    """New price for the same pair. Pre-game: modify in place (quantity kept). A LIVE quote always re-prices by
+    cancel + post: 11-04 19:24Z a live modify applied more than 1.5 s after the call, while a cancel + post lands in
+    0.2-0.7 s, and in play a quote resting at the old price that long is the one that gets picked off."""
     s = STATE
+    if q.live:
+        return _repost(db, cfg, brokers, q, c, f"re-price to {c.price:.2f} (live: cancel + post)", log)
     if not s.modify_ok:
-        s.stats["repriced"] += 1
-        r = pull(db, cfg, brokers, q, f"re-price to {c.price:.2f}", log)
-        if r == "halt" or q.oid in s.quotes:
-            return r
-        return post(db, cfg, brokers, c, log)
+        return _repost(db, cfg, brokers, q, c, f"re-price to {c.price:.2f}", log)
     b = brokers["Polymarket"]
     ok, err = b.modify(q.pm, q.oid, c.price, q.qty)
     now = time.time()
-    if ok and s.modify_checks < MODIFY_CHECKS:
+    if not ok:
+        # refused outright (HTTP error): modify is not usable on this account -- cancel + post for the run
+        s.modify_ok = False
+        log(f"  ! modify refused ({q.title} {q.oid}): {err} -- re-pricing by cancel + post from now on")
+        return _repost(db, cfg, brokers, q, c, f"re-price to {c.price:.2f}", log)
+    if s.modify_checks < MODIFY_CHECKS:
         # read the order back: the reply is empty on success, so the first few are confirmed from the order itself
         s.modify_checks += 1
         deadline = time.time() + MODIFY_WAIT
+        slow = ""
         while True:
             try:
                 st = b.order_state(q.pm, q.oid)
             except Exception as e:
-                ok, err = False, f"read-back failed: {e}"
+                slow = f"read-back failed: {e}"
                 break
             if st.get("cum"):
                 return _filled(db, cfg, brokers, q, st, log)
-            took = st.get("price") is None or abs(st["price"] - c.price) < 1e-6
-            if st.get("done") or took or time.time() >= deadline:
-                if st.get("done") or not took:
-                    ok, err = False, f"order reads {st.get('state')} @ {st.get('price')} {MODIFY_WAIT:g}s after the modify"
+            if st.get("price") is None or abs(st["price"] - c.price) < 1e-6:
+                break
+            if st.get("done") or time.time() >= deadline:
+                slow = f"order reads {st.get('state')} @ {st.get('price')} {MODIFY_WAIT:g}s after the modify"
                 break
             time.sleep(0.1)
-    if not ok:
-        s.modify_ok = False
-        log(f"  ! modify did not take ({q.title} {q.oid}): {err} -- re-pricing by cancel + post from now on")
-        return reprice(db, cfg, brokers, q, c, log)
+        if slow:
+            # accepted but not applied yet (or unreadable): this quote's price is unknown -> cancel it and post fresh.
+            # Only a run of them turns modify off; one slow modify is not a broken one.
+            s.modify_slow += 1
+            if s.modify_slow >= MODIFY_CHECKS:
+                s.modify_ok = False
+            log(f"  ! modify slow ({q.title} {q.oid}): {slow} -- this quote re-posted"
+                + ("; 3 slow in a row: cancel + post from now on" if not s.modify_ok else ""))
+            return _repost(db, cfg, brokers, q, c, f"re-price to {c.price:.2f} (modify slow)", log)
+        s.modify_slow = 0
     old = q.price
     q.price, q.k_ask, q.priced_at = c.price, c.k_ask, now
     db.execute("UPDATE quotes SET price=?, k_ask=? WHERE order_id=?", (q.price, q.k_ask, q.oid))

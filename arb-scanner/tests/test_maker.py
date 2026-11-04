@@ -210,7 +210,22 @@ class ChurnTests(Base):
         self.assertFalse(maker.STATE.modify_ok)
         self.assertNotEqual(maker.STATE.quote.oid, old)                 # a fresh order at the new price
         self.assertAlmostEqual(maker.STATE.quote.price, 0.41)
-        self.assertTrue(any("modify did not take" in x for x in logs))
+        self.assertTrue(any("modify refused" in x for x in logs))
+
+    def test_one_slow_modify_reposts_that_quote_but_keeps_modify_on(self):
+        g, pm, k = pair()
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        old = maker.STATE.quote.oid
+        b = self.paper["Polymarket"]
+        real = b.order_state
+        b.order_state = lambda c_, oid: {**real(c_, oid), "price": 0.39} if oid == old else real(c_, oid)
+        pm.book.bids = [(0.40, 50)]
+        maker.STATE.quote.priced_at -= 10
+        with mock.patch.object(maker, "MODIFY_WAIT", 0.2):
+            maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        self.assertTrue(maker.STATE.modify_ok)
+        self.assertNotEqual(maker.STATE.quote.oid, old)
+        self.assertAlmostEqual(maker.STATE.quote.price, 0.41)
 
     def test_polymarket_live_flag_pulls(self):
         g, pm, k = pair()
@@ -371,6 +386,20 @@ class LiveTests(Base):
         logs = []
         maker.step(self.db, self.cfg, self.paper, [g], log=logs.append, full=True)
         self.assertTrue(any("the game started" in x for x in logs))
+
+    def test_live_quote_reprices_by_cancel_and_post(self):
+        g, pm, k = pair(k_asks=[(0.50, 100)])            # room under the 4c live ceiling (0.44) to move up a tick
+        g.live = True
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        old = maker.STATE.quote.oid
+        self.paper["Polymarket"].modify = mock.Mock()
+        pm.book.bids = [(0.40, 50)]
+        maker.STATE.quote.priced_at -= 10
+        maker.STATE.last_post = 0
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        self.paper["Polymarket"].modify.assert_not_called()
+        self.assertNotEqual(maker.STATE.quote.oid, old)
+        self.assertAlmostEqual(maker.STATE.quote.price, 0.41)
 
     def test_live_slot_cap(self):
         cfg = trader.Config(maker=True, max_per_trade=20, min_profit=0.0, maker_in_play=("nfl",), maker_live_quotes=1)
