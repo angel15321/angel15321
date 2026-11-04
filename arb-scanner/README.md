@@ -47,6 +47,27 @@ python -m arbscan run
 7. **Log and settle.** Every order goes into `trades.db` and `arbscan.log`. After
    each game it reads the official result and books the real P&L.
 
+## Maker mode (`--maker`)
+
+As a taker the bot lost every race in-play (11-02/03: 50 attempts, 0 hedged; the quotes were pulled before
+even a 10 ms Kalshi order landed). `--maker` turns it around: it **rests one post-only bid on Polymarket US**
+and lets the fill come to it, then hedges on Kalshi, the fast venue.
+
+- **Price:** for each Polymarket contract and the Kalshi contract covering the other outcomes, the most it
+  may pay is `payout - (Kalshi ask + Kalshi taker fee) - edge` (Polymarket makers pay no fee). It bids one
+  tick over the best Polymarket bid (its own excluded), never above that ceiling and never at or above the
+  ask (post-only: a crossing quote is rejected, not taken). `--maker-edge-c` (default 1¢ a pair).
+- **Pull:** the quote is cancelled when the Kalshi ask it is priced from gets worse or thinner, a feed
+  stops, the game starts (schedule or Polymarket's live flag), or after `--maker-ttl` (120 s). Re-posts at
+  most every 2 s. One quote at a time, sized by `--max-per-trade`.
+- **Fill:** seen on the private order stream (REST poll every 1 s as backup), hedged on Kalshi at once, the
+  rest of the quote cancelled, then the usual hedge retries and sell-back-or-hold rule.
+- **Safety:** every quote is written to the `quotes` table before it is sent; quotes a crash left open are
+  cancelled at the next start (a fill meanwhile becomes an `error` row, which halts). Every exit cancels the
+  resting quote. Three refused quotes in a row pause maker mode.
+- **Scope:** games starting within `--maker-horizon-h` (24 h); `--maker-in-play` adds games in progress
+  (riskier: news moves Kalshi before a Polymarket cancel lands). The taker path is off while it runs.
+
 ## Setup for live trading
 
 ```bash

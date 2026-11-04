@@ -8,7 +8,10 @@ Every broker exposes the same three calls:
 
 Nothing ever rests on a book: Kalshi orders are `immediate_or_cancel`, and
 Polymarket US orders are immediate-or-cancel limit orders (anything the
-exchange reports as still open afterwards is cancelled).
+exchange reports as still open afterwards is cancelled). The one exception is
+maker mode (maker.py): post() rests a post-only Polymarket bid, and
+order_state() / cancel() follow it, each returning
+{"state", "done", "cum" (contracts filled), "avg" (our side's price), "fee"}.
 
 Credentials (live mode only) come from environment variables:
 
@@ -135,6 +138,32 @@ class PaperBroker:
         fee = sum(c.fee.fill_fee(p, x) for p, x in fills)
         self.cash += notional - fee
         return Fill(self.venue, "sell", c.label, q, notional / q, fee, f"paper-{uuid.uuid4().hex[:8]}", "filled")
+
+    # maker mode: a paper quote fills in full once the live ask reaches its price (someone sold into it)
+    def post(self, c: Contract, qty: float, limit: float) -> Fill:
+        oid = f"paper-q-{uuid.uuid4().hex[:8]}"
+        self.quotes = getattr(self, "quotes", {})
+        self.quotes[oid] = {"qty": qty, "price": limit, "state": "resting", "cum": 0.0}
+        return Fill(self.venue, "buy", c.label, order_id=oid, status="resting")
+
+    def order_state(self, c: Contract, oid: str) -> dict:
+        from . import trader
+        q = getattr(self, "quotes", {}).get(oid)
+        if q is None:
+            return {"state": "unknown", "done": True, "cum": 0.0, "avg": 0.0, "fee": 0.0}
+        if q["state"] == "resting":
+            book = trader.live_book(c) or c.book
+            if book.best_ask is not None and book.best_ask <= q["price"] + 1e-9:
+                q.update(state="filled", cum=q["qty"])
+                self.cash -= q["qty"] * q["price"]
+        return {"state": q["state"], "done": q["state"] != "resting", "cum": q["cum"], "avg": q["price"], "fee": 0.0}
+
+    def cancel(self, c: Contract, oid: str) -> dict:
+        st = self.order_state(c, oid)
+        q = getattr(self, "quotes", {}).get(oid)
+        if q is not None and q["state"] == "resting":
+            q["state"] = "canceled"
+        return {**st, "state": q["state"] if q else st["state"], "done": True}
 
 
 # ---------------------------------------------------------------- Kalshi
@@ -363,6 +392,66 @@ class PolymarketBroker:
         except Exception:
             pass
         return o
+
+    # ------------------------------------------------------------ maker mode
+
+    def post(self, c: Contract, qty: float, limit: float) -> Fill:
+        """Rest a post-only bid for `qty` of c at `limit` (our side's price). Fill(status="resting", order_id)
+        when it rests; "rejected"/"error" otherwise (a crossing quote is rejected, never taken)."""
+        tick = c.tick or 0.01
+        if c.ref["side"] == "long":
+            yes_px, intent = floor_to(limit, tick), "ORDER_INTENT_BUY_LONG"
+        else:
+            yes_px, intent = ceil_to(1 - limit, tick), "ORDER_INTENT_BUY_SHORT"
+        yes_px = min(max(round(yes_px, 4), tick), 1 - tick)
+        body = {"marketSlug": c.ref["slug"], "intent": intent, "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": f"{yes_px:.4f}", "currency": "USD"}, "quantity": floor_to(qty, 0.01),
+                "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL", "participateDontInitiate": True,
+                "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC"}
+        try:
+            r = self._req("POST", "/v1/orders", body)
+        except Exception as e:
+            return Fill(self.venue, "buy", c.label, status="error", error=str(e))
+        oid = r.get("id") or (r.get("order") or {}).get("id") or ""
+        execs = r.get("executions") or []
+        rej = next((x for x in execs if x.get("type") == "EXECUTION_TYPE_REJECTED"), None)
+        if rej:
+            return Fill(self.venue, "buy", c.label, order_id=oid, status="rejected",
+                        error=f"{rej.get('orderRejectReason', '')} {rej.get('text', '')}".strip())
+        if not oid:
+            return Fill(self.venue, "buy", c.label, status="error", error=f"no order id in reply: {str(r)[:300]}")
+        return Fill(self.venue, "buy", c.label, order_id=oid, status="resting", raw={"request_price": body["price"]["value"]})
+
+    def _state(self, c: Contract, o: dict) -> dict:
+        cum = float(o.get("cumQuantity") or 0)
+        avg_yes = float((o.get("avgPx") or {}).get("value") or 0)
+        avg = (avg_yes if c.ref["side"] == "long" else 1 - avg_yes) if cum else 0.0
+        fee_v = (o.get("commissionNotionalTotalCollected") or {}).get("value")
+        return {"state": o.get("state", ""), "done": o.get("state") in self.done, "cum": cum, "avg": avg,
+                "fee": float(fee_v) if fee_v not in (None, "") else 0.0}
+
+    def order_state(self, c: Contract, oid: str) -> dict:
+        return self._state(c, self._req("GET", f"/v1/order/{oid}").get("order") or {})
+
+    def cancel(self, c: Contract, oid: str, wait: float = 1.5) -> dict:
+        """Cancel and read the final state (filled quantity included). {"error"} when the cancel failed."""
+        err = ""
+        try:
+            self._req("POST", f"/v1/order/{oid}/cancel", {"marketSlug": c.ref["slug"]})
+        except Exception as e:
+            err = str(e)        # often "already filled / cancelled": the read below decides
+        deadline, st = time.time() + wait, None
+        while True:
+            try:
+                st = self.order_state(c, oid)
+            except Exception as e:
+                st = {"error": f"{err} / read: {e}" if err else f"read: {e}"}
+            if st.get("done") or time.time() >= deadline:
+                break
+            time.sleep(0.1)
+        if not st.get("done") and err and not st.get("error"):
+            st["error"] = err
+        return st
 
     def buy(self, c: Contract, qty: float, limit: float, notional_hint: float | None = None) -> Fill:
         tick = c.tick or 0.01

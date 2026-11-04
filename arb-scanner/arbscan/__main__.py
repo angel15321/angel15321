@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import signal
 import sys
 
 from . import engine, fees, kalshi, kalshiws, pmws, polymarket, report, scanner, trader
@@ -58,7 +59,9 @@ def cmd_run(a):
         in_play_only=a.in_play_only, leg1=a.leg1,
         cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports,
         legs=a.legs, max_book_age=a.max_book_age, trigger=a.trigger, event_gap=a.event_gap_ms / 1000,
-        confirm_s=a.confirm_ms / 1000, stale_pm=a.stale_pm, hedge_max_loss=a.hedge_max_loss)
+        confirm_s=a.confirm_ms / 1000, stale_pm=a.stale_pm, hedge_max_loss=a.hedge_max_loss,
+        maker=a.maker, maker_edge=a.maker_edge_c / 100, maker_ttl=a.maker_ttl, maker_in_play=a.maker_in_play,
+        maker_horizon_h=a.maker_horizon_h, maker_max_qty=a.maker_max_qty)
     log = _log_to(a.log)
     try:
         brokers = trader.make_brokers(cfg, kalshi_demo=a.kalshi_demo)
@@ -84,10 +87,20 @@ def cmd_run(a):
         f" · Kalshi books <= {cfg.max_book_age:g}s old"
         + (f" · trigger: every book change (confirm {cfg.confirm_s * 1000:.0f} ms, per game <= 1/{cfg.event_gap * 1000:.0f} ms)"
            if cfg.trigger == "event" else f" · trigger: scan every {max(1.0, a.interval):g}s")
-        + f" · sports: {', '.join(cfg.sports)}")
+        + f" · sports: {', '.join(cfg.sports)}"
+        + (f" · MAKER: post-only Polymarket bids, edge >= {cfg.maker_edge * 100:.1f} c/pair, hedge on Kalshi, "
+           f"{'pre-game + in-play' if cfg.maker_in_play else 'pre-game only'} (<= {cfg.maker_horizon_h:g} h), "
+           f"re-price <= every {cfg.maker_reprice:g}s, refresh {cfg.maker_ttl:g}s; taker arbs OFF" if cfg.maker else ""))
     if not _attach_feed(log) and cfg.live:
         sys.exit("Live trading needs the Polymarket US websocket (POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY): "
                  "the REST books lag the exchange by 10-30 s.")
+    if cfg.maker:
+        of = pmws.OrderFeed.from_env() if cfg.live else None
+        polymarket._orders = of
+        log("Polymarket order updates: private websocket (REST poll every 1 s as backup)" if of is not None
+            else "Polymarket order updates: REST poll every 1 s")
+    # systemd stops the bot with SIGTERM: turn it into the Ctrl-C path so a resting quote is cancelled on the way out
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     log(f"Stop: Ctrl-C, or create a file named '{cfg.kill_file}' here. Ledger: {a.db}")
     try:
         trader.run(db, cfg, brokers, a.days, a.interval, once=a.once, log=log)
@@ -220,6 +233,15 @@ def main(argv=None):
                    help="event trigger: re-check one game at most this often (default 50 ms)")
     r.add_argument("--confirm-ms", type=float, default=30,
                    help="event trigger: an arb must still be there this long after it first appears (default 30 ms)")
+    r.add_argument("--maker", action="store_true",
+                   help="MAKER mode: rest one post-only Polymarket bid priced off Kalshi's ask and hedge on Kalshi when it "
+                        "fills, instead of taking arbs. Pre-game only unless --maker-in-play")
+    r.add_argument("--maker-edge-c", type=float, default=1.0,
+                   help="maker: cents per pair the quote must make after both venues' fees (default 1)")
+    r.add_argument("--maker-ttl", type=float, default=120, help="maker: re-price a quote after this many seconds (default 120)")
+    r.add_argument("--maker-in-play", action="store_true", help="maker: also quote games in progress (riskier: news moves first)")
+    r.add_argument("--maker-horizon-h", type=float, default=24, help="maker: quote games starting within N hours (default 24)")
+    r.add_argument("--maker-max-qty", type=float, default=0, help="maker: contracts per quote cap (default 0 = $ caps only)")
     r.add_argument("--max-book-age", type=float, default=1.0,
                    help="skip an arb priced from a Kalshi book older than this many seconds (default 1.0); Polymarket books are re-read from the live feed right before pricing")
     r.add_argument("--cross-venue-only", action="store_true")

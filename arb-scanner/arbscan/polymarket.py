@@ -77,6 +77,7 @@ def _event_markets(slug: str, kinds: dict = KINDS) -> list[dict]:
 
 
 _feed = None             # pmws.BookFeed when live books are available (see use_feed)
+_orders = None           # pmws.OrderFeed in maker mode: our own order updates
 
 
 def use_feed(feed) -> None:

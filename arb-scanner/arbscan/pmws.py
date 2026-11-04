@@ -28,6 +28,8 @@ IDLE_EVICT = 3600.0      # seconds a market may go unrequested before it leaves 
 
 
 class BookFeed:
+    recv_timeout = DEAD_AFTER * 3          # s of silence before the connection is dropped and re-made
+
     def __init__(self, key_id: str, secret_key_b64: str, url: str = URL):
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         self.key_id = key_id
@@ -126,7 +128,7 @@ class BookFeed:
                     backoff = 1.0
                     await self._subscribe_missing()
                     while True:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=DEAD_AFTER * 3)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=self.recv_timeout)
                         self.last_msg = time.time()
                         self._handle(raw)
             except Exception as e:  # reconnect on anything: network, auth hiccup, server close
@@ -162,3 +164,75 @@ class BookFeed:
                 cb(md["marketSlug"])
         elif m.get("error"):
             self.error = str(m["error"])[:200]
+
+
+PRIVATE_URL = "wss://api.polymarket.us/v1/ws/private"
+PRIVATE_PATH = "/v1/ws/private"
+
+
+class OrderFeed(BookFeed):
+    """Our own order updates (maker mode) over the private websocket, SUBSCRIPTION_TYPE_ORDER: the fastest
+    word that a resting quote filled. maker.poll() falls back to a REST read when this has nothing, so a
+    message shape this does not parse costs speed, not safety. The first messages are kept in `samples`
+    for the log (the wire format is read from the SDK, not yet seen live)."""
+    recv_timeout = 3600.0                  # a quiet account is silent for long; websocket pings check the link
+
+    def __init__(self, key_id: str, secret_key_b64: str, url: str = PRIVATE_URL):
+        self.orders: dict[str, tuple[float, dict]] = {}     # order id -> (received at, order)
+        self.samples: list[str] = []
+        super().__init__(key_id, secret_key_b64, url)
+        self.wanted = {"orders"}
+
+    def _headers(self) -> dict:
+        ts = str(int(time.time() * 1000))
+        sig = self.key.sign(f"{ts}GET{PRIVATE_PATH}".encode())
+        return {"X-PM-Access-Key": self.key_id, "X-PM-Timestamp": ts,
+                "X-PM-Signature": base64.b64encode(sig).decode()}
+
+    def want(self, slugs) -> set[str]:
+        return set()
+
+    def alive(self) -> bool:
+        return self.connected          # a quiet account sends little: connected is the signal
+
+    async def _subscribe_missing(self) -> None:
+        ws = self._ws
+        if ws is None or "orders" in self._sent:
+            return
+        self._sent.add("orders")
+        await ws.send(json.dumps({"subscribe": {"requestId": f"ord-{int(time.time() * 1000)}",
+                                                "subscriptionType": "SUBSCRIPTION_TYPE_ORDER"}}))
+
+    def _handle(self, raw) -> None:
+        if len(self.samples) < 5:
+            self.samples.append(str(raw)[:400])
+        try:
+            m = json.loads(raw)
+        except ValueError:
+            return
+        if m.get("error"):
+            self.error = str(m["error"])[:200]
+        up = m.get("orderSubscriptionUpdate") or m.get("orderUpdate") or {}
+        ex = up.get("execution") or m.get("execution") or {}
+        o = ex.get("order") or up.get("order")
+        if not isinstance(o, dict) or not o.get("id"):
+            return
+        self.orders[o["id"]] = (time.time(), o)
+        cb = getattr(self, "on_update", None)
+        if cb is not None:
+            cb("pmorder:" + o["id"])
+
+    def state(self, oid: str, c) -> dict | None:
+        """maker's state dict for an order this stream has seen, else None."""
+        hit = self.orders.get(oid)
+        if hit is None or c is None:
+            return None
+        o = hit[1]
+        cum = float(o.get("cumQuantity") or 0)
+        avg_yes = float((o.get("avgPx") or {}).get("value") or 0)
+        avg = (avg_yes if c.ref["side"] == "long" else 1 - avg_yes) if cum else 0.0
+        fee_v = (o.get("commissionNotionalTotalCollected") or {}).get("value")
+        done = o.get("state") in ("ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED",
+                                  "ORDER_STATE_EXPIRED")
+        return {"state": o.get("state", ""), "done": done, "cum": cum, "avg": avg,
+                "fee": float(fee_v) if fee_v not in (None, "") else 0.0}

@@ -32,7 +32,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import engine, kalshi, polymarket, scanner
+from . import engine, kalshi, maker, polymarket, scanner
 from .brokers import Fill, floor_to, max_price_within
 from .model import Contract
 
@@ -66,6 +66,7 @@ def connect(path: str) -> sqlite3.Connection:
         if col not in cols:
             db.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
             db.commit()
+    maker.connect(db)
     return db
 
 
@@ -110,6 +111,18 @@ class Config:
     hedge_max_loss: float = 0.0       # $/contract leg 2 may pay ABOVE break-even to get hedged (0 = break-even only);
                                       # a bounded locked loss instead of a $20 one-sided hold -- operator's call, off by default
     max_book_age: float = 1.0         # s: an arb priced from an older Kalshi (REST) book is skipped
+    # maker mode (maker.py): rest a post-only Polymarket bid priced off Kalshi's ask, hedge on Kalshi when it fills.
+    # It replaces the taker path (no IOC arbs are taken while it runs).
+    maker: bool = False
+    maker_edge: float = 0.01          # $ per pair the quote must still make after both venues' fees
+    maker_min_price: float = 0.03     # no quote / hedge priced under 3c or over 97c (11-03 row 50: a 1c/98c pair at a match's end)
+    maker_ttl: float = 120.0          # s: a quote is pulled and re-priced after this long
+    maker_reprice: float = 2.0        # s: at most one re-post per this long
+    maker_poll: float = 1.0           # s: REST fill check when the private order stream has nothing
+    maker_in_play: bool = False       # quote games in progress too (off: pre-game only)
+    maker_horizon_h: float = 24.0     # quote games starting within this many hours
+    maker_max_qty: float = 0.0        # contracts per quote cap (0 = only the $ caps)
+    maker_max_rejects: int = 3        # Polymarket refusing this many quotes in a row pauses maker mode
 
 
 # ---------------------------------------------------------------- helpers
@@ -538,10 +551,23 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
     trig = None
     if cfg.trigger == "event":
         trig = Trigger()
-        for feed in (polymarket._feed, kalshi._feed):
+        for feed in (polymarket._feed, kalshi._feed, polymarket._orders):
             if feed is not None:
                 feed.on_update = trig.mark
+    if cfg.maker:
+        maker.reset()
+        maker.recover(db, cfg, brokers, log)
+        try:
+            _loop(db, cfg, brokers, days, interval, once, log, state, trig, mode)
+        finally:
+            maker.shutdown(db, cfg, brokers, log)
+        return
+    _loop(db, cfg, brokers, days, interval, once, log, state, trig, mode)
+
+
+def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool, log, state: dict, trig, mode: str):
     next_scan = 0.0
+    maker_at = time.time()
     while True:
         if time.time() >= next_scan:
             if os.path.exists(cfg.kill_file):
@@ -571,10 +597,22 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
                     f"{s.get('pm_skipped', 0)} stale-PM skipped")
                 state["stats"] = {k: 0 for k in s}
                 state["stats_at"] = time.time()
+            if cfg.maker and time.time() - maker_at >= 60:
+                log(maker.stats_text())
+                maker_at = time.time()
+        if cfg.maker:
+            try:
+                if maker.poll(db, cfg, brokers, log) == "halt":
+                    next_scan = 0.0
+                    continue
+            except Exception as e:
+                log(f"! maker poll error: {type(e).__name__}: {e}")
         if trig is None:
-            time.sleep(max(0.0, next_scan - time.time()))
+            time.sleep(max(0.0, min(next_scan, time.time() + (cfg.maker_poll if cfg.maker else 1e9)) - time.time()))
             continue
         due = min([next_scan] + list(state["due"].values()))
+        if cfg.maker and maker.STATE.quote is not None:
+            due = min(due, maker.STATE.quote.polled_at + cfg.maker_poll)
         trig.event.wait(max(0.0, due - time.time()))
         try:
             if _on_events(db, cfg, brokers, state, trig.take(), log) == "halt":
@@ -693,10 +731,15 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None =
     mode = "live" if cfg.live else "dry"
     # In-play scans only fetch games starting within 30 min (Kalshi kickoffs are
     # estimates, so the exact in-progress filter is applied below).
-    snap = scanner.snapshot(min(days, 0.02) if cfg.in_play_only else days, sports=cfg.sports)
+    window = max(cfg.maker_horizon_h / 24, 0.02) if cfg.maker else (min(days, 0.02) if cfg.in_play_only else days)
+    snap = scanner.snapshot(window, sports=cfg.sports)
     now = dt.datetime.now(dt.timezone.utc)
     moves = _moves(snap.games)
-    if cfg.in_play_only:
+    if cfg.maker:
+        # pre-game games inside the horizon (+ in-play ones with --maker-in-play)
+        games = [g for g in snap.games if (not g.started(now) and g.start is not None)
+                 or (cfg.maker_in_play and g.started(now) and (g.live is not None or now - dt.timedelta(hours=5) < g.start))]
+    elif cfg.in_play_only:
         # A game with a venue live flag (tennis) is in play exactly while the flag is on.
         games = [g for g in snap.games if g.started(now)
                  and (g.live is not None or now - dt.timedelta(hours=5) < g.start)]
@@ -748,6 +791,8 @@ def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=Non
         log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
             f"{sum(len(g.contracts) for g in games):,} contracts · {len(fresh)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
             + stale_note + feed_note + (" · " + "; ".join(scan_errors) if scan_errors else ""))
+    if cfg.maker:
+        return maker.step(db, cfg, brokers, games, log, full=scan_errors is not None)
     # which venue of each pair just moved: the OTHER one holds the stale quote and is leg 1 (first_leg)
     changed_of = {o.key: {x.venue for x in (o.a, o.b) if market_key(x) in dirty} for o in fresh} if dirty else {}
     if state is not None:
