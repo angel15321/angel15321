@@ -135,6 +135,8 @@ class Config:
     # the trading thread only applies the finished snapshot. False (--scan-inline) = the scan blocks the trading
     # thread again, as until 11-05.
     scan_thread: bool = True
+    maker_event_gap: float = 0.5      # s: maker mode, a game we have NO quote on is re-priced at most this often on book
+                                      # changes (its quotes are safe without it: maker.guard); a quoted game keeps event_gap
 
 
 # ---------------------------------------------------------------- helpers
@@ -476,40 +478,91 @@ SETTLE_GAP = 60.0      # s between exchange settlement reads from the trading lo
 _settled_at = 0.0
 
 
-def settle(db, log=print, min_gap: float = 0.0) -> int:
-    """Price open rows from each venue's official result. No fixed 'kickoff + N h' wait: NBA games end
-    in ~2h15m and tennis start times are schedule slots, so the exchange's own status decides; only
-    rows whose game has not started yet are skipped. `min_gap` paces the reads from the 1-s loop."""
-    global _settled_at
-    if min_gap and time.time() - _settled_at < min_gap:
-        return 0
-    _settled_at = time.time()
+_settle = {"job": None, "pool": None}
+
+
+def _due_rows(db) -> list:
+    """Open rows whose game has started: (id, qty_a, qty_b, [(ref, venue, qty), ...])."""
     now = dt.datetime.now(dt.timezone.utc)
-    n = 0
+    out = []
     for r in db.execute("SELECT * FROM trades WHERE status='open'").fetchall():
         if r["kickoff"] and dt.datetime.fromisoformat(r["kickoff"]) > now:
             continue
-        payout, ok = 0.0, True
+        legs = []
         for leg, q in (("leg_a", r["qty_a"]), ("leg_b", r["qty_b"])):
-            if not q:
-                continue
-            s = json.loads(r[leg])
+            if q:
+                x = json.loads(r[leg])
+                legs.append((x["ref"], x["venue"], q))
+        out.append((r["id"], r["qty_a"], r["qty_b"], legs))
+    return out
+
+
+def _payouts_of(rows: list) -> list:
+    """The venues' official results for those rows (network; no ledger access): (id, qty_a, qty_b, payout or None)."""
+    out = []
+    for rid, qa, qb, legs in rows:
+        payout = 0.0
+        for ref, venue, q in legs:
             try:
-                v = scanner.settlement(s["ref"], s["venue"])
+                v = scanner.settlement(ref, venue)
             except Exception:
                 v = None
             if v is None:
-                ok = False
+                payout = None
                 break
             payout += q * v
-        if not ok:
+        out.append((rid, qa, qb, payout))
+    return out
+
+
+def _book_settled(db, results: list, log) -> int:
+    n = 0
+    for rid, qa, qb, payout in results:
+        if payout is None:
             continue
+        r = db.execute("SELECT * FROM trades WHERE id=? AND status='open'", (rid,)).fetchone()
+        if r is None or (r["qty_a"], r["qty_b"]) != (qa, qb):
+            continue                             # closed or changed (a late hedge / sell-back) since it was read
         pnl = payout - r["cash_out"]
         db.execute("UPDATE trades SET status='settled', payout=?, pnl=?, settled_at=? WHERE id=?",
-                   (payout, pnl, time.time(), r["id"]))
+                   (payout, pnl, time.time(), rid))
         db.commit()
         n += 1
-        log(f"  $ SETTLED #{r['id']} {r['game']}: payout ${payout:,.2f}, P&L {pnl:+,.2f}")
+        log(f"  $ SETTLED #{rid} {r['game']}: payout ${payout:,.2f}, P&L {pnl:+,.2f}")
+    return n
+
+
+def settle(db, log=print, min_gap: float = 0.0, background: bool = False) -> int:
+    """Price open rows from each venue's official result. No fixed 'kickoff + N h' wait: NBA games end
+    in ~2h15m and tennis start times are schedule slots, so the exchange's own status decides; only
+    rows whose game has not started yet are skipped. `min_gap` paces the reads from the 1-s loop.
+    background=True (the trading loop): the reads run on a worker thread and are booked at a later call -- they
+    go through the public-data throttle, where they queued behind the scan thread's requests (11-05: blocks of
+    1.6-2.3 s once a minute on the trading thread)."""
+    global _settled_at
+    if not background:
+        if min_gap and time.time() - _settled_at < min_gap:
+            return 0
+        _settled_at = time.time()
+        return _book_settled(db, _payouts_of(_due_rows(db)), log)
+    n = 0
+    job = _settle["job"]
+    if job is not None:
+        if not job.done():
+            return 0
+        _settle["job"] = None
+        try:
+            n = _book_settled(db, job.result(), log)
+        except Exception as e:
+            log(f"! settle error: {e}")
+    if min_gap and time.time() - _settled_at < min_gap:
+        return n
+    _settled_at = time.time()
+    rows = _due_rows(db)
+    if rows:
+        if _settle["pool"] is None:
+            _settle["pool"] = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="settle")
+        _settle["job"] = _settle["pool"].submit(_payouts_of, rows)
     return n
 
 
@@ -642,7 +695,8 @@ def held_legs(db, mode: str) -> int:
 
 
 def _timing() -> dict:
-    return {"scan": [], "apply": [], "busy": 0.0, "block": 0.0, "at": time.time()}
+    return {"scan": [], "apply": [], "busy": 0.0, "block": 0.0, "at": time.time(),
+            "t_events": 0.0, "t_apply": 0.0, "t_poll": 0.0, "t_guard": 0.0, "t_house": 0.0}
 
 
 def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool = False, log=print):
@@ -678,10 +732,12 @@ def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bo
         scan = ScanThread(cfg, days, interval, wake=lambda: trig.mark(SCAN_KEY))
         scan.start()
         log("Full scans run on their own thread; the trading thread applies each finished one (--scan-inline = as before)")
+    _cash["bg"] = scan is not None    # balance re-reads off the trading thread (maker._room)
     try:
         return _loop_on(db, cfg, brokers, days, interval, once, log, state, trig, mode, scan)
     finally:
         _halted = ""                  # the flag belongs to this run of the loop
+        _cash["bg"] = False
         if scan is not None:
             scan.stop()
 
@@ -695,19 +751,28 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
     watching = False                  # halted, staying up for held legs
     tm = state.setdefault("timing", _timing())
     busy_from = time.time()
+    stale_s = max(SCAN_STALE_S, 5 * interval)
+    lap_at = [time.time()]
+
+    def lap(key: str) -> None:                   # where this thread's time goes, for the 60-s line
+        t = time.time()
+        tm[key] = tm.get(key, 0.0) + t - lap_at[0]
+        lap_at[0] = t
     while True:
+        lap_at[0] = time.time()
         if cfg.maker and cfg.scan_thread and maker.STATE.quotes and not _halted:
             try:                                 # first thing on every pass: the resting quotes vs the live books
                 if maker.guard(db, cfg, brokers, log) == "halt":
                     next_scan = 0.0
             except Exception as e:
                 log(f"! maker guard error: {type(e).__name__}: {e}")
+            lap("t_guard")
         if time.time() >= next_scan or (scan is not None and scan.ready()):
             if os.path.exists(cfg.kill_file):
                 log(f"Kill switch: '{cfg.kill_file}' exists — stopping.")
                 return
-            try:
-                settle(db, log, min_gap=SETTLE_GAP)     # before the halt check: held positions settle while halted
+            try:                                 # before the halt check: held positions settle while halted
+                settle(db, log, min_gap=SETTLE_GAP, background=scan is not None)
             except Exception as e:
                 log(f"! settle error: {e}")
             streak = recent_failures(db, mode, cfg.max_failures)
@@ -733,6 +798,7 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
                         log("Halted: no held leg left to watch — stopping.")
                     return
                 watching = True
+            lap("t_house")
             t0 = time.time()
             snap = scan.take() if scan is not None else None
             if scan is None or snap is not None:
@@ -750,7 +816,7 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
                 if scan.error and scan.error != scan_said:
                     scan_said = scan.error
                     log(f"! scan error: {scan.error}")
-                if idle > SCAN_STALE_S and state.get("games"):
+                if idle > stale_s and state.get("games"):
                     log(f"! no full scan for {idle:.0f}s ({scan.error or 'still running'}): game list dropped and "
                         "quotes pulled until scans are back")
                     state["games"], state["index"] = [], {}
@@ -778,6 +844,7 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
             if cfg.maker and time.time() - maker_at >= 60:
                 log(maker.stats_text())
                 maker_at = time.time()
+            lap("t_apply")
         if cfg.maker:
             try:
                 if maker.poll(db, cfg, brokers, log) == "halt":
@@ -785,22 +852,26 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
                     continue
             except Exception as e:
                 log(f"! maker poll error: {type(e).__name__}: {e}")
+            finally:
+                lap("t_poll")
         if trig is None:
             time.sleep(max(0.0, min(next_scan, time.time() + (cfg.maker_poll if cfg.maker else 1e9)) - time.time()))
             continue
         due = min([next_scan] + list(state["due"].values()))
         if cfg.maker and maker.STATE.quotes:
-            due = min([due] + [q.polled_at + cfg.maker_poll for q in maker.STATE.quotes.values()])
+            due = min([due] + [q.polled_at + (maker.DEAD_POLL if q.dead else cfg.maker_poll)
+                               for q in maker.STATE.quotes.values()])
         t_wait = time.time()
         tm["busy"] += t_wait - busy_from
         tm["block"] = max(tm["block"], t_wait - busy_from)
         trig.event.wait(max(0.0, due - t_wait))
-        busy_from = time.time()
+        busy_from = lap_at[0] = time.time()
         try:
             if _on_events(db, cfg, brokers, state, trig.take(), log) == "halt":
                 next_scan = 0.0                          # the halt check at the top of the loop reports it
         except Exception as e:
             log(f"! event error: {type(e).__name__}: {e}")
+        lap("t_events")
 
 
 def timing_text(tm: dict, now: float) -> str:
@@ -809,6 +880,12 @@ def timing_text(tm: dict, now: float) -> str:
     span = max(1e-9, now - tm["at"])
     out = (f"  trading thread, last {span:.0f}s: busy {100 * tm['busy'] / span:.0f}% of the time · longest block "
            f"{tm['block'] * 1000:.0f} ms")
+    parts = [(name, tm.get(k, 0.0)) for k, name in (("t_events", "pricing book changes"), ("t_apply", "applying scans"),
+                                                    ("t_poll", "order checks"), ("t_guard", "quote checks"),
+                                                    ("t_house", "housekeeping"))]
+    shown = [f"{name} {100 * v / span:.0f}%" for name, v in parts if v >= span / 200]
+    if shown:
+        out += " (" + ", ".join(shown) + ")"
     if tm["scan"]:
         sc, ap = tm["scan"], tm["apply"]
         out += (f" · {len(ap)} scans applied in {1000 * sum(ap) / len(ap):.0f} ms avg / {1000 * max(ap):.0f} ms max"
@@ -832,8 +909,12 @@ def _on_events(db, cfg: Config, brokers: dict, state: dict, keys: set[str], log)
         if at <= now and gk in by_key:
             games[gk] = by_key[gk]
     run_now = []
+    quoted = {q.game_key for q in maker.STATE.quotes.values()} if cfg.maker and cfg.scan_thread else None
     for gk, g in games.items():
-        wait = state["last_eval"].get(gk, 0.0) + cfg.event_gap - now
+        # maker: a game we hold no quote on is only looked at for a NEW quote, and 20 looks a second at each live
+        # NBA game kept the trading thread 100% busy (11-05 04:57Z: 47 game checks a second)
+        gap = cfg.event_gap if quoted is None or gk in quoted else max(cfg.event_gap, cfg.maker_event_gap)
+        wait = state["last_eval"].get(gk, 0.0) + gap - now
         if wait > 0:
             state["due"][gk] = min(state["due"].get(gk, float("inf")), now + wait)   # throttled: look again soon
             continue
@@ -913,14 +994,24 @@ CASH_TTL = 20.0        # s: Kalshi rate-limits balance reads per account, shared
 CASH_STALE_OK = 120.0  # s: on a failed read, an older balance still caps the size
 
 
-def balances(brokers: dict, force: bool = False) -> dict[str, float]:
+def balances(brokers: dict, force: bool = False, background: bool = False) -> dict[str, float]:
     """Venue cash, read at most every CASH_TTL seconds. After a trade spend() adjusts the cached pots from the
     fills and marks them dirty: the next call re-reads, but a failed re-read (Kalshi 429) still returns the
     adjusted copy while it is under CASH_STALE_OK old -- zeroing `at` instead (until 11-03) made that copy
-    unusable and one 429 right after a trade dropped every remaining arb of the evaluation."""
+    unusable and one 429 right after a trade dropped every remaining arb of the evaluation.
+    background=True (maker, inside the trading loop): a due re-read runs on its own thread and this call returns
+    the cached pots at once -- they already carry every fill (spend) -- as long as they are under CASH_STALE_OK old."""
     now = time.time()
     if not force and not _cash["dirty"] and _cash["values"] is not None and now - _cash["at"] < CASH_TTL:
         return _cash["values"]
+    if (background and _cash.get("bg") and not force and _cash["values"] is not None
+            and now - _cash["at"] < CASH_STALE_OK):
+        vals, t = _cash["values"], _cash.get("thread")
+        if t is None or not t.is_alive():
+            _cash["thread"] = threading.Thread(target=_reread_cash, args=(brokers, _cash.get("gen", 0)),
+                                               name="cash", daemon=True)
+            _cash["thread"].start()
+        return vals
     try:
         vals = {v: b.balance() for v, b in brokers.items()}
     except Exception:
@@ -929,6 +1020,19 @@ def balances(brokers: dict, force: bool = False) -> dict[str, float]:
         raise
     _cash.update(at=now, values=vals, dirty=False)
     return vals
+
+
+def _reread_cash(brokers: dict, gen: int) -> None:
+    """Worker: read both venues and replace the cached pots -- unless a trade debited them meanwhile (spend() bumps
+    `gen`): that read is older than the debit and is dropped; the next call starts a new one."""
+    t0 = time.time()
+    try:
+        vals = {v: b.balance() for v, b in brokers.items()}
+    except Exception:
+        _cash["dirty"] = True
+        return
+    if _cash.get("gen", 0) == gen:
+        _cash.update(at=t0, values=vals, dirty=False)
 
 
 def spend(brokers: dict, opp, fills: list[dict]) -> None:
@@ -949,6 +1053,7 @@ def spend(brokers: dict, opp, fills: list[dict]) -> None:
             if sh in shards:
                 shards[sh] = max(0.0, shards[sh] + cash)
     _cash["dirty"] = True
+    _cash["gen"] = _cash.get("gen", 0) + 1
 
 
 def startup_balances(brokers: dict, tries: int = 5, wait: float = 2.0, log=print) -> dict[str, float]:

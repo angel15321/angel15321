@@ -66,8 +66,11 @@ class GuardTests(Maker):
             maker.STATE.guard_at -= 0.25                       # the loop was busy for 250 ms
             maker.guard(self.db, self.cfg, self.paper, QUIET["log"])
         self.assertAlmostEqual(maker.STATE.guard_gap, 0.25, delta=0.05)
-        self.assertIn("quotes checked live at most 2", maker.stats_text())
-        self.assertEqual(maker.STATE.guard_gap, 0.0)           # per 60-s line
+        line = maker.stats_text()
+        self.assertIn("quotes checked live every 2", line)     # median, 95th and the longest gap
+        self.assertIn("at most 2", line)
+        self.assertIn("Polymarket calls: cancels", line)
+        self.assertEqual((maker.STATE.guard_gap, maker.STATE.gaps), (0.0, []))      # per 60-s line
         maker.STATE.quotes.clear()
         maker.guard(self.db, self.cfg, self.paper, QUIET["log"])
         self.assertEqual(maker.STATE.guard_at, 0.0)            # nothing resting: no gap is counted across it

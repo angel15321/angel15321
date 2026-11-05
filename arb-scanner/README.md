@@ -90,6 +90,13 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
   bot owns (the cancel's own round trip comes on top) -- and the trading-thread line `busy N% · longest block`.
   Pricing itself is ~5x cheaper: the payout of a pair of legs is computed once and kept, and the cooldown is one
   ledger read per check instead of one per candidate.
+- **Nothing slow on the trading thread:** a pull sends the cancel and reads the order once; it does not wait
+  for the cancel to show. Until it does the quote is "dead" (keeps its slot, never re-priced) and is confirmed
+  from the private order stream, or a read every 0.3 s. An order the stream follows is read over REST every
+  3 s as a safety net (every second only while the stream has not shown it). A game we hold no quote on is
+  re-priced on book changes at most every 0.5 s (`maker_event_gap`); a quoted game keeps 50 ms. Settlement
+  and balance reads run on worker threads. The 60-s lines say where the time went (`pricing book changes N%,
+  applying scans N%, order checks N%`) and how far apart the live quote checks were (median, 95th, longest).
 - **Scope:** games starting within `--maker-horizon-h` (24 h). `--maker-in-play nhl,tennis,nba,nfl` (no value =
   every `--sports`) also quotes games in progress of those sports, with a bigger required edge
   (`--maker-live-edge-c`, 4¢ a pair), at most `--maker-live-quotes` (2) of the slots, and a pull on ANY Kalshi

@@ -56,6 +56,9 @@ MODIFY_WAIT = 1.5        # s: a modify is applied a moment after its (empty) rep
 SWAP_AGE = 30.0          # s: a quote must have rested this long before a better pair elsewhere may replace it
 ROOM_SLACK = 1.15        # new quotes are sized into room / this, so a re-price a tick or two up still fits the room
 STOP_TRIES = 4           # cancel passes on the way out (each waits up to 1.5 s per quote; systemd allows 20 s)
+DEAD_POLL = 0.3          # s between looks at a quote whose cancel is out but not confirmed yet
+STREAM_POLL = 3.0        # s between REST reads of a quote the private order stream is following (a safety net only;
+                         # 11-05: one read a second per quote was three round trips a second on the trading thread)
 SUSPECT_S = 30.0         # s a quote whose post came back as an ERROR is looked for on Polymarket (the exchange
                          # processes or rejects an order within 5 s of receiving it; our HTTP timeout is 15 s)
 
@@ -86,8 +89,10 @@ class Quote:
     booked: float = 0.0          # contracts of this order already in a trade row (a fill is booked once)
     booked_notional: float = 0.0
     booked_fee: float = 0.0
-    dead: bool = False           # filled in part and its cancel is not confirmed yet: never re-priced, cancelled again
-                                 # every poll, and any further fill is still hedged and booked (11-05 review)
+    dead: bool = False           # its cancel is out but not confirmed yet: never re-priced or checked again, the cancel
+                                 # is confirmed (or sent again) by poll(), and any fill meanwhile is hedged and booked
+    why: str = ""                # why it was pulled (the ledger note once the cancel is confirmed)
+    cancel_at: float = 0.0       # when its cancel was last sent
 
     def unbooked(self, st: dict) -> float:
         """Contracts the order state `st` shows filled that no trade row holds yet."""
@@ -111,6 +116,8 @@ class State:
     quotable: dict = field(default_factory=dict)   # game key -> quotable pairs at its last check (for the log)
     guard_at: float = 0.0     # last live check of the resting quotes (0 = nothing was resting)
     guard_gap: float = 0.0    # longest time between two of them since the last 60-s line: the pull latency we own
+    gaps: list = field(default_factory=list)       # every such gap since the last 60-s line (median / 95th for the log)
+    net: dict = field(default_factory=lambda: {"cancel": 0.0, "post": 0.0, "read": 0.0})   # s in Polymarket calls
     suspects: list = field(default_factory=list)   # posts that came back as an error: may rest all the same
     sweep_at: float = 0.0
     stats: dict = field(default_factory=lambda: {"quotable": 0, "posted": 0, "pulled": 0, "repriced": 0,
@@ -248,7 +255,7 @@ def _room(db, cfg, brokers, log) -> tuple[float, float, dict | None, float]:
     mode = "live" if cfg.live else "dry"
     room = min(cfg.max_daily_spend - trader.spent_today(db, mode), cfg.max_open - trader.open_exposure(db, mode))
     try:
-        cash = trader.balances(brokers)
+        cash = trader.balances(brokers, background=True)     # in the loop: never a balance read on this thread
     except Exception as e:
         log(f"! maker: balance check failed: {e}")
         return 0.0, 0.0, None, 0.0
@@ -402,6 +409,8 @@ def guard(db, cfg, brokers, log):
     now, now_dt = time.time(), dt.datetime.now(dt.timezone.utc)
     if s.guard_at:
         s.guard_gap = max(s.guard_gap, now - s.guard_at)
+        if len(s.gaps) < 100_000:
+            s.gaps.append(now - s.guard_at)
     s.guard_at = now
     for q in list(s.quotes.values()):
         if q.dead or q.pm is None or q.k is None:
@@ -458,8 +467,9 @@ def _unsafe(cfg, q: Quote, seen: bool, now: float, now_dt) -> str:
 
 def post(db, cfg, brokers, c: Cand, log):
     s = STATE
-    s.last_post = time.time()
+    s.last_post = t0 = time.time()
     f = brokers["Polymarket"].post(c.pm, c.qty, c.price)
+    s.net["post"] += time.time() - t0
     if f.status != "resting" or not f.order_id:
         s.rejects += 1
         log(f"  ! quote not placed {c.game.title}: {c.pm.label} @ {c.price:.2f} -- {f.status}: {f.error}")
@@ -622,11 +632,25 @@ def _mark_row(db, oid: str, filled: float, note: str) -> None:
 
 def _cancel(brokers, c: Contract, oid: str, wait: float | None = None) -> dict:
     """Cancel + read the order. wait=0: one read, no waiting for the state to turn (the repeat on a dead quote)."""
+    t0 = time.time()
     try:
         b = brokers["Polymarket"]
         return (b.cancel(c, oid) if wait is None else b.cancel(c, oid, wait=wait)) or {}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        STATE.net["cancel"] += time.time() - t0
+
+
+def _read(brokers, q: Quote) -> dict:
+    """One REST read of a quote's order ({"error"} when it failed)."""
+    t0 = time.time()
+    try:
+        return brokers["Polymarket"].order_state(q.pm, q.oid) or {}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        STATE.net["read"] += time.time() - t0
 
 
 def _confirmed(st: dict) -> bool:
@@ -639,50 +663,73 @@ def _drop(db, q: Quote, note: str) -> None:
     _close_row(db, q.oid, q.booked, note)
 
 
-def pull(db, cfg, brokers, q: Quote, why: str, log):
-    """Cancel one resting quote; a fill that happened meanwhile is hedged."""
+def pull(db, cfg, brokers, q: Quote, why: str, log, wait: float | None = 0.0):
+    """Cancel one resting quote; a fill that happened meanwhile is hedged.
+
+    The cancel is SENT here and read back once (wait=0); it is not waited for. Until 11-05 every pull polled the
+    order until it read cancelled (up to 1.5 s), and nothing else -- no other quote's pull -- could happen meanwhile.
+    A quote whose cancel has not shown yet is `dead`: it keeps its slot, is never re-priced, and poll() confirms it
+    from the order stream or a read every DEAD_POLL s (sending the cancel again each maker_poll s). wait=None is the
+    blocking form, for the way out."""
     s = STATE
     if q.oid not in s.quotes:
         return None
-    st = _cancel(brokers, q.pm, q.oid)
+    q.cancel_at = time.time()
+    st = _cancel(brokers, q.pm, q.oid, wait=wait)
     if q.unbooked(st) > 1e-9:
+        if not q.why:
+            q.why = why
         return _filled(db, cfg, brokers, q, st, log, cancelled=True)
+    first = not q.dead
+    if first:
+        q.why = q.why or why
+        s.stats["pulled"] += 1
+        log(f"  ✕ pulled {q.title} {q.pm.label} @ {q.price:.2f}: {why}")
     if not _confirmed(st):
-        log(f"  ! quote cancel not confirmed ({q.title} {q.oid}): {st.get('error') or st.get('state')}; retrying")
-        return None                             # still ours, still resting: the next step tries again
-    s.stats["pulled"] += 1
-    _drop(db, q, f"pulled: {why}" + (f"; {q.booked:g} had filled" if q.booked else ""))
-    log(f"  ✕ pulled {q.title} {q.pm.label} @ {q.price:.2f}: {why}")
+        q.dead, q.polled_at = True, time.time()
+        if wait is None or st.get("error"):
+            log(f"  ! quote cancel not confirmed ({q.title} {q.oid}): {st.get('error') or st.get('state')}; retrying")
+        return None
+    _drop(db, q, f"pulled: {q.why}" + (f"; {q.booked:g} had filled" if q.booked else ""))
     return None
 
 
 def poll(db, cfg, brokers, log, force: bool = False):
-    """Fill check per quote: the private order stream when it has the order, else a REST read every maker_poll s.
-    A dead quote (filled in part, cancel not confirmed) gets its cancel again instead, and any further fill is booked."""
+    """Fill check per quote. The private order stream is the first word; a REST read backs it up every maker_poll s
+    for an order the stream has not shown, every STREAM_POLL s for one it follows. A dead quote (cancel out, not
+    confirmed) is confirmed here, and anything it fills meanwhile is hedged and booked."""
     s = STATE
     now = time.time()
     feed = polymarket._orders
     if s.suspects and _sweep(db, cfg, brokers, log, now) == "halt":
         return "halt"
     for q in list(s.quotes.values()):
+        st = feed.state(q.oid, q.pm) if feed is not None else None
         if q.dead:
-            if force or now - q.polled_at >= cfg.maker_poll:
+            if st is None or (not _confirmed(st) and q.unbooked(st) <= 1e-9):
+                if not force and now - q.polled_at < DEAD_POLL:
+                    continue
                 q.polled_at = now
-                st = _cancel(brokers, q.pm, q.oid, wait=0.0)
-                if q.unbooked(st) > 1e-9:
-                    if _filled(db, cfg, brokers, q, st, log, cancelled=True) == "halt":
-                        return "halt"
-                elif _confirmed(st):
-                    _drop(db, q, f"filled {q.booked:g}; its cancel was confirmed late")
+                if force or now - q.cancel_at >= cfg.maker_poll:
+                    q.cancel_at = now
+                    st = _cancel(brokers, q.pm, q.oid, wait=0.0)      # not showing after a second: send it again
+                else:
+                    st = _read(brokers, q)
+            if q.unbooked(st) > 1e-9:
+                if _filled(db, cfg, brokers, q, st, log, cancelled=True) == "halt":
+                    return "halt"
+            elif _confirmed(st):
+                _drop(db, q, (f"pulled: {q.why}" if q.why else "its cancel was confirmed late")
+                      + (f"; {q.booked:g} had filled" if q.booked else ""))
+                if q.booked:
                     log(f"  ✕ quote {q.title} {q.oid}: cancel confirmed, {q.booked:g} had filled")
             continue
-        st = feed.state(q.oid, q.pm) if feed is not None else None
-        if (st is None or q.unbooked(st) <= 1e-9) and (force or now - q.polled_at >= cfg.maker_poll):
+        every = STREAM_POLL if st is not None and feed.alive() else cfg.maker_poll
+        if (st is None or q.unbooked(st) <= 1e-9) and (force or now - q.polled_at >= every):
             q.polled_at = now
-            try:
-                st = brokers["Polymarket"].order_state(q.pm, q.oid)
-            except Exception as e:
-                log(f"! maker: order read failed: {e}")
+            st = _read(brokers, q)
+            if st.get("error"):
+                log(f"! maker: order read failed: {st['error']}")
                 continue
         if not st:
             continue
@@ -740,7 +787,8 @@ def _filled(db, cfg, brokers, q: Quote, st: dict, log, cancelled: bool = False):
     t_hedge = time.time()
     done = _confirmed(st)
     if not cancelled and not done:
-        fin = _cancel(brokers, pm, q.oid)
+        q.cancel_at = time.time()
+        fin = _cancel(brokers, pm, q.oid, wait=0.0)        # sent and read once: poll() confirms it (see pull)
         more = None if fin.get("error") else _fill_since(q, fin)
         if more is not None and more.qty > f1.qty + 1e-9:           # more filled before the cancel landed
             f1 = more
@@ -756,8 +804,8 @@ def _filled(db, cfg, brokers, q: Quote, st: dict, log, cancelled: bool = False):
         # The rest of the quote may still be resting. Until 11-05 it was dropped here with a log line: a later fill
         # had no hedge, no ledger row and no cap. Now it stays tracked: poll() cancels again and books what fills.
         q.dead, q.polled_at = True, time.time()
-        log(f"  ! quote {q.oid} ({q.title}) cancel after its fill not confirmed: {st.get('error') or st.get('state')} "
-            "-- still tracked, cancelling again every poll")
+        log(f"  ! quote {q.oid} ({q.title}) cancel after its fill not confirmed yet: {st.get('error') or st.get('state')} "
+            "-- still tracked until it is")
     a_is_pm = q.key.split("|")[0] == pm.id
     a, b = (pm, k) if a_is_pm else (k, pm)
     guaranteed, middle = engine.guaranteed_payout(a, b)
@@ -812,7 +860,7 @@ def shutdown(db, cfg, brokers, log) -> None:
     for _ in range(STOP_TRIES):
         for q in list(STATE.quotes.values()):
             try:
-                pull(db, cfg, brokers, q, "the bot is stopping", log)
+                pull(db, cfg, brokers, q, "the bot is stopping", log, wait=None)      # here the cancel IS waited for
             except Exception as e:
                 log(f"! maker: could not cancel the resting quote {q.oid} on exit: {e} -- CANCEL IT ON POLYMARKET")
         if not STATE.quotes:
@@ -891,9 +939,22 @@ def stats_text() -> str:
     out = (f"  maker, last 60s: {s['quotable']} pairs quotable · {s['posted']} posted · {s['modified']} re-priced by "
            f"modify · {s['repriced']} swapped · {s['pulled']} pulled · {s['fills']} filled · "
            f"resting {len(STATE.quotes)}" + (f": {rest}" if rest else "")
-           + (f" · quotes checked live at most {STATE.guard_gap * 1000:.0f} ms apart" if STATE.guard_gap else "")
+           + _gap_text()
            + (" · modify OFF (cancel + post)" if not STATE.modify_ok else "")
            + (f" · PAUSED: {STATE.paused}" if STATE.paused else ""))
     STATE.stats = {k: 0 for k in s}
-    STATE.guard_gap = 0.0
+    STATE.guard_gap, STATE.gaps = 0.0, []
+    STATE.net = {k: 0.0 for k in STATE.net}
     return out
+
+
+def _gap_text() -> str:
+    """How far apart the live checks of the resting quotes were (the pull latency the bot owns), and how long the
+    trading thread spent inside Polymarket calls."""
+    g = sorted(STATE.gaps)
+    if not g:
+        return ""
+    n = STATE.net
+    return (f" · quotes checked live every {g[len(g) // 2] * 1000:.0f} ms (median), {g[int(len(g) * 0.95)] * 1000:.0f} ms "
+            f"(95th), at most {g[-1] * 1000:.0f} ms apart · Polymarket calls: cancels {n['cancel']:.1f}s, posts "
+            f"{n['post']:.1f}s, order reads {n['read']:.1f}s")
