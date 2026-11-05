@@ -713,6 +713,26 @@ def pull(db, cfg, brokers, q: Quote, why: str, log, wait: float | None = 0.0):
     return None
 
 
+def _poll_every(cfg, q: Quote, st, feed) -> float:
+    """s between the REST looks poll() takes at `q` (st = what the private order stream holds for it)."""
+    if q.dead:
+        return DEAD_POLL
+    return STREAM_POLL if st is not None and feed.alive() else cfg.maker_poll
+
+
+def next_poll(cfg) -> float:
+    """When poll() next has a REST look due (inf with nothing resting): what the trading loop sleeps until. It must
+    be poll()'s OWN clock -- 11-05 13:02Z the loop woke on `polled_at + maker_poll` (1 s) while poll() read a
+    stream-followed order every STREAM_POLL (3 s): two seconds in three the wait was already over, and the loop
+    span at 290,000 passes a minute, 98% busy."""
+    feed = polymarket._orders
+    due = float("inf")
+    for q in STATE.quotes.values():
+        st = feed.state(q.oid, q.pm) if feed is not None else None
+        due = min(due, q.polled_at + _poll_every(cfg, q, st, feed))
+    return due
+
+
 def poll(db, cfg, brokers, log, force: bool = False):
     """Fill check per quote. The private order stream is the first word; a REST read backs it up every maker_poll s
     for an order the stream has not shown, every STREAM_POLL s for one it follows. A dead quote (cancel out, not
@@ -743,8 +763,7 @@ def poll(db, cfg, brokers, log, force: bool = False):
                 if q.booked:
                     log(f"  ✕ quote {q.title} {q.oid}: cancel confirmed, {q.booked:g} had filled")
             continue
-        every = STREAM_POLL if st is not None and feed.alive() else cfg.maker_poll
-        if (st is None or q.unbooked(st) <= 1e-9) and (force or now - q.polled_at >= every):
+        if (st is None or q.unbooked(st) <= 1e-9) and (force or now - q.polled_at >= _poll_every(cfg, q, st, feed)):
             q.polled_at = now
             st = _read(brokers, q)
             if st.get("error"):

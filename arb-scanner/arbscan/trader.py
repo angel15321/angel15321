@@ -880,8 +880,7 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
             continue
         due = min([next_scan] + list(state["due"].values()))
         if cfg.maker and maker.STATE.quotes:
-            due = min([due] + [q.polled_at + (maker.DEAD_POLL if q.dead else cfg.maker_poll)
-                               for q in maker.STATE.quotes.values()])
+            due = min(due, maker.next_poll(cfg))         # poll()'s own clock: an earlier one spins the loop
         t_wait = time.time()
         tm["busy"] += t_wait - busy_from
         tm["block"] = max(tm["block"], t_wait - busy_from)
@@ -927,7 +926,9 @@ def _on_events(db, cfg: Config, brokers: dict, state: dict, keys: set[str], log)
             games[g.key] = g
     by_key = {g.key: g for g in state["games"]}
     for gk, at in list(state["due"].items()):
-        if at <= now and gk in by_key:
+        if gk not in by_key:
+            state["due"].pop(gk)                 # its game left the list: a clock nobody answers spins the loop
+        elif at <= now:
             games[gk] = by_key[gk]
     run_now = []
     quoted = {q.game_key for q in maker.STATE.quotes.values()} if cfg.maker and cfg.scan_thread else None
