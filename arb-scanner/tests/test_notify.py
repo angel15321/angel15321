@@ -53,6 +53,13 @@ class QueueTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}):
             self.assertFalse(notify.start(log=lambda *_: None))
 
+    def test_start_reads_the_environment_and_says_so_once(self):
+        notify.configure()
+        with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}),                 mock.patch("threading.Thread") as th, mock.patch.dict(notify._cfg, {"thread": None}):
+            self.assertTrue(notify.start(log=lambda *_: None))
+            th.assert_called_once()
+            self.assertEqual([x[1][:7] for x in notify._q], ["started"])
+
     def test_sent_only_after_the_queue_has_been_still(self):
         t = mst(12)
         self.push_at(t, "🛡 HEDGE FILLED #1 · A v B")

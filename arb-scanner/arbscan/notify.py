@@ -53,6 +53,7 @@ def start(log=print) -> bool:
         _cfg["thread"].start()
     log(f"Telegram: hedge outcomes are sent ~{SETTLE_S:.0f} s after the last one (never from the trading thread); "
         f"held {QUIET_START_H}:00-0{QUIET_END_H}:00 MST and sent at 5 AM; a halt is sent at once")
+    push("started · hedge fills, failed hedges and a halt are reported here")     # proves the path after a restart
     return True
 
 
