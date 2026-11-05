@@ -127,6 +127,9 @@ class StepTests(Base):
         venues = [f["venue"] for f in json.loads(row["fills"])]
         self.assertEqual(venues, ["Polymarket", "Kalshi"])
         self.assertIn("filled", self.db.execute("SELECT note FROM quotes").fetchone()[0])
+        probe = json.loads(row["probe"])
+        self.assertEqual(probe["k_live_at_fill"]["asks"][0][0], 0.39)    # live_book (mocked) is what was logged live
+        self.assertEqual(probe["k_cached_at_fill"]["asks"][0][0], 0.55)
 
     def test_fill_with_the_hedge_gone_is_held_and_counts_as_failure(self):
         g, pm, k = pair()

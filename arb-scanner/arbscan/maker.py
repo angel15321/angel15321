@@ -533,6 +533,11 @@ def _filled(db, cfg, brokers, q: Quote, st: dict, log, cancelled: bool = False):
     mode = "live" if cfg.live else "dry"
     detected = time.time()
     pm, k = q.pm, q.k
+    # Kalshi's book from the live feed right now (no network), before the hedge: the quote's own copy of k.book is
+    # only as fresh as the last check of its game (11-05 #53 logged 0.32 cached while Kalshi was already at 0.51)
+    kb = trader.live_book(k)
+    k_live = ({"asks": [[p_, sz] for p_, sz in kb.asks[:3]], "age": round(detected - kb.fetched_at, 3)}
+              if kb is not None else None)
     f1 = Fill("Polymarket", "buy", pm.label, st["cum"], st["avg"] or q.price, st.get("fee") or 0.0, q.oid, "filled",
               raw={"state": st.get("state"), "maker": True})
     cost1 = (f1.notional + f1.fee) / f1.qty
@@ -557,11 +562,14 @@ def _filled(db, cfg, brokers, q: Quote, st: dict, log, cancelled: bool = False):
                          q.qty * (q.price + q.k_ask), q.qty * k.fee.per_contract(q.k_ask), q.qty * q.guaranteed)
     opp = engine.Opportunity(q.game, a, b, guaranteed, middle, plan)
     probe = {"maker": True, "quote": {"price": q.price, "qty": q.qty, "k_ask": q.k_ask, "age_s": round(detected - q.posted_at, 2)},
-             "k_book_at_fill": [[p, sz] for p, sz in k.book.asks[:3]], "hedge1_ms": round((t_hedge - detected) * 1000, 1),
-             "changed": None}
+             "k_live_at_fill": k_live,
+             "k_cached_at_fill": {"asks": [[p, sz] for p, sz in k.book.asks[:3]],
+                                  "age": round(detected - k.book.fetched_at, 3)},
+             "hedge1_ms": round((t_hedge - detected) * 1000, 1), "changed": None}
     fills = [f1] + ([f2] if f2 is not None else [])
+    live_ask = k_live["asks"][0][0] if k_live and k_live["asks"] else None
     log(f"  ◉ QUOTE FILLED {q.title}: {f1.qty:g} {pm.label} @ {f1.avg_price:.3f} on Polymarket; hedging {k.label} "
-        f"on Kalshi (limit {limit2:.3f})")
+        f"on Kalshi (limit {limit2:.3f}; Kalshi ask {q.k_ask:.2f} at the quote, {live_ask} live at the fill)")
     row = trader._after_leg1(db, mode, opp, plan, detected, fills, pm, k, f1, f2, "a" if a_is_pm else "b",
                              f2 is not None, brokers, cfg, log, probe)
     _close_row(db, q.oid, f1.qty, f"filled -> trade #{row.get('id')} {row.get('outcome')}")
