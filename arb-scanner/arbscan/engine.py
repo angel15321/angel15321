@@ -83,14 +83,24 @@ class Opportunity:
         return f"both win if {m(lo)}" if lo == hi else f"both win if result is {m(lo)} … {m(hi)}"
 
 
+_payouts: dict = {}      # (side, line, tie_half) of both legs -> guaranteed_payout's answer
+
+
 def guaranteed_payout(a: Contract, b: Contract) -> tuple[float, tuple[int, int] | None]:
     """Minimum combined payout over every integer outcome, and the outcome
-    window (if any) where both pay in full."""
-    lo = math.floor(min(a.line, b.line)) - 2
-    hi = math.ceil(max(a.line, b.line)) + 2
-    worst = min(a.payout(x) + b.payout(x) for x in range(lo, hi + 1))
-    both = [x for x in range(lo, hi + 1) if a.payout(x) == 1 and b.payout(x) == 1]
-    return worst, ((both[0], both[-1]) if both else None)
+    window (if any) where both pay in full. It depends only on the two legs' side, line and tie rule, so the
+    answer is kept: pricing every pair of a game on every book change spent most of its time in here (11-05)."""
+    key = (a.side, a.line, a.tie_half, b.side, b.line, b.tie_half)
+    hit = _payouts.get(key)
+    if hit is None:
+        lo = math.floor(min(a.line, b.line)) - 2
+        hi = math.ceil(max(a.line, b.line)) + 2
+        worst = min(a.payout(x) + b.payout(x) for x in range(lo, hi + 1))
+        both = [x for x in range(lo, hi + 1) if a.payout(x) == 1 and b.payout(x) == 1]
+        if len(_payouts) > 100_000:
+            _payouts.clear()
+        hit = _payouts[key] = (worst, ((both[0], both[-1]) if both else None))
+    return hit
 
 
 def _walk(a: Contract, b: Contract, guaranteed: float, max_outlay: float | None,

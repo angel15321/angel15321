@@ -82,8 +82,14 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
 - **Speed:** with `--trigger event` the full scan (market lists, game state, first book reads) runs on its own
   thread and the trading thread only applies the finished snapshot, re-reading every book from the live feeds
   (never REST) before it prices anything; `--scan-inline` puts the scan back on the trading thread. If no scan
-  finishes for 10 s the game list is dropped and every quote pulled until scans are back. Every minute the log
-  shows `trading thread: busy N% · longest block M ms` -- the longest time a quote could not be pulled.
+  finishes for 10 s the game list is dropped and every quote pulled until scans are back.
+- **Pulls come first:** at the start of every pass of the trading loop, and between pricing slices of about one
+  NBA game (160 contracts), the two or three resting quotes are checked against the feeds' live books
+  (`maker.guard`, no network, microseconds). Pricing 60 games no longer stands between a Kalshi tick and the
+  pull it calls for. The 60-s maker line shows `quotes checked live at most N ms apart` -- the pull latency the
+  bot owns (the cancel's own round trip comes on top) -- and the trading-thread line `busy N% · longest block`.
+  Pricing itself is ~5x cheaper: the payout of a pair of legs is computed once and kept, and the cooldown is one
+  ledger read per check instead of one per candidate.
 - **Scope:** games starting within `--maker-horizon-h` (24 h). `--maker-in-play nhl,tennis,nba,nfl` (no value =
   every `--sports`) also quotes games in progress of those sports, with a bigger required edge
   (`--maker-live-edge-c`, 4¢ a pair), at most `--maker-live-quotes` (2) of the slots, and a pull on ANY Kalshi

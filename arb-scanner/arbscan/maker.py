@@ -108,6 +108,9 @@ class State:
     modify_checks: int = 0
     modify_slow: int = 0      # slow modifies in a row (accepted, not applied within MODIFY_WAIT)
     ids: set = field(default_factory=set)          # every order id tracked this run (resting or closed)
+    quotable: dict = field(default_factory=dict)   # game key -> quotable pairs at its last check (for the log)
+    guard_at: float = 0.0     # last live check of the resting quotes (0 = nothing was resting)
+    guard_gap: float = 0.0    # longest time between two of them since the last 60-s line: the pull latency we own
     suspects: list = field(default_factory=list)   # posts that came back as an error: may rest all the same
     sweep_at: float = 0.0
     stats: dict = field(default_factory=lambda: {"quotable": 0, "posted": 0, "pulled": 0, "repriced": 0,
@@ -304,11 +307,16 @@ def step(db, cfg, brokers, games, log, full: bool = False):
     if per < 2:
         return None
     own = {q.pm_id: q for q in s.quotes.values()}
+    taken = trader.recent_keys(db, cfg.cooldown_min)        # one read, not one per candidate
     cands = [c for c in candidates(cfg, ok, per, own)
-             if now - c.k.book.fetched_at <= cfg.max_book_age
-             and not trader.recently_taken(db, c.key, cfg.cooldown_min)]
+             if now - c.k.book.fetched_at <= cfg.max_book_age and c.key not in taken]
     if full:
         s.stats["quotable"] = max(s.stats["quotable"], len(cands))
+        s.quotable = {}
+    for g in ok:
+        s.quotable[g.key] = 0
+    for c in cands:
+        s.quotable[c.game.key] = s.quotable.get(c.game.key, 0) + 1
     by_key = {}
     for c in cands:
         by_key.setdefault(c.key, c)
@@ -379,6 +387,48 @@ def step(db, cfg, brokers, games, log, full: bool = False):
     if k_pot < best.qty * (best.k_ask + best.k.fee.per_contract(best.k_ask)) - 1e-9:
         return None
     return post(db, cfg, brokers, best, log)
+
+
+def guard(db, cfg, brokers, log):
+    """Every resting quote against the LIVE books, before anything slower. Reads the feeds' in-memory books (no
+    network) for our own two or three quotes only, so it costs microseconds and the trading loop runs it at the
+    start of every pass and between pricing slices: a pull never waits for a scan or for the pricing of other
+    games (11-05: quotes filled with Kalshi already 8-20c past the price they were quoted off)."""
+    s = STATE
+    if not s.quotes:
+        s.guard_at = 0.0
+        return None
+    from . import trader
+    now, now_dt = time.time(), dt.datetime.now(dt.timezone.utc)
+    if s.guard_at:
+        s.guard_gap = max(s.guard_gap, now - s.guard_at)
+    s.guard_at = now
+    for q in list(s.quotes.values()):
+        if q.dead or q.pm is None or q.k is None:
+            continue
+        kb = trader.live_book(q.k)
+        if kb is not None:
+            q.k.book = kb                        # the game's own contract object: the next pricing sees it too
+        why = _unsafe(cfg, q, True, now, now_dt)
+        if why and pull(db, cfg, brokers, q, why, log) == "halt":
+            return "halt"
+    return None
+
+
+def sync(db, cfg, brokers, games, log):
+    """A full scan arrived: follow its (new) contract objects, pull a quote whose market is not in it any more,
+    then check every quote against the live books. The pricing of the games themselves follows in slices."""
+    s = STATE
+    by_id = {c.id: (g, c) for g in games for c in g.contracts}
+    for q in list(s.quotes.values()):
+        if q.pm_id in by_id and q.k_id in by_id:
+            q.game, q.pm = by_id[q.pm_id]
+            q.k = by_id[q.k_id][1]
+        elif not q.dead and pull(db, cfg, brokers, q, "its market left the scan", log) == "halt":
+            return "halt"
+    keys = {g.key for g in games}
+    s.quotable = {k: v for k, v in s.quotable.items() if k in keys}
+    return guard(db, cfg, brokers, log)
 
 
 def _unsafe(cfg, q: Quote, seen: bool, now: float, now_dt) -> str:
@@ -837,10 +887,13 @@ def stats_text() -> str:
     s = STATE.stats
     rest = "; ".join(f"{q.title} {q.pm.label} @ {q.price:.2f} x{q.qty:g}" + (" (CANCEL PENDING)" if q.dead else "")
                      for q in STATE.quotes.values() if q.pm)
+    s["quotable"] = max(s["quotable"], sum(STATE.quotable.values()))
     out = (f"  maker, last 60s: {s['quotable']} pairs quotable · {s['posted']} posted · {s['modified']} re-priced by "
            f"modify · {s['repriced']} swapped · {s['pulled']} pulled · {s['fills']} filled · "
            f"resting {len(STATE.quotes)}" + (f": {rest}" if rest else "")
+           + (f" · quotes checked live at most {STATE.guard_gap * 1000:.0f} ms apart" if STATE.guard_gap else "")
            + (" · modify OFF (cancel + post)" if not STATE.modify_ok else "")
            + (f" · PAUSED: {STATE.paused}" if STATE.paused else ""))
     STATE.stats = {k: 0 for k in s}
+    STATE.guard_gap = 0.0
     return out

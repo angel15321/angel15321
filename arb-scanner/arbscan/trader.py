@@ -260,6 +260,12 @@ def probe_text(p: dict) -> str:
     return s
 
 
+def recent_keys(db, minutes: float) -> set:
+    """Every pair acted on in the last `minutes` (the cooldown), in one read."""
+    return {r[0] for r in db.execute("SELECT DISTINCT opp_key FROM trades WHERE detected_at>?",
+                                     (time.time() - minutes * 60,))}
+
+
 def recently_taken(db, key: str, minutes: float) -> bool:
     return db.execute("SELECT 1 FROM trades WHERE opp_key=? AND detected_at>? LIMIT 1",
                       (key, time.time() - minutes * 60)).fetchone() is not None
@@ -690,6 +696,12 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
     tm = state.setdefault("timing", _timing())
     busy_from = time.time()
     while True:
+        if cfg.maker and cfg.scan_thread and maker.STATE.quotes and not _halted:
+            try:                                 # first thing on every pass: the resting quotes vs the live books
+                if maker.guard(db, cfg, brokers, log) == "halt":
+                    next_scan = 0.0
+            except Exception as e:
+                log(f"! maker guard error: {type(e).__name__}: {e}")
         if time.time() >= next_scan or (scan is not None and scan.ready()):
             if os.path.exists(cfg.kill_file):
                 log(f"Kill switch: '{cfg.kill_file}' exists — stopping.")
@@ -831,7 +843,47 @@ def _on_events(db, cfg: Config, brokers: dict, state: dict, keys: set[str], log)
     if not run_now:
         return None
     state["stats"]["evals"] += len(run_now)
+    if cfg.maker and cfg.scan_thread:
+        return _evaluate_sliced(db, cfg, brokers, run_now, state["moves"], log, state=state, dirty=keys)
     return _evaluate(db, cfg, brokers, run_now, state["moves"], log, state=state, dirty=keys)
+
+
+SLICE_CONTRACTS = 160    # contracts priced between two live checks of the resting quotes (about one NBA game)
+
+
+def _slices(games, quoted: set) -> list:
+    """Games in pricing order -- the ones we have a quote on first -- cut into slices of about SLICE_CONTRACTS."""
+    out, cur, n = [], [], 0
+    for g in sorted(games, key=lambda g: g.key not in quoted):
+        if cur and n + len(g.contracts) > SLICE_CONTRACTS:
+            out.append(cur)
+            cur, n = [], 0
+        cur.append(g)
+        n += len(g.contracts)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _evaluate_sliced(db, cfg: Config, brokers: dict, games, moves, log, state: dict | None = None,
+                     dirty: set[str] | None = None):
+    """Maker mode: price `games` a slice at a time with a live check of the resting quotes before each slice, so
+    pricing 60 games (a few hundred ms of Python) never stands between a Kalshi tick and the pull it calls for."""
+    quoted = {q.game_key for q in maker.STATE.quotes.values()}
+    for chunk in _slices(games, quoted):
+        if not _halted and maker.guard(db, cfg, brokers, log) == "halt":
+            return "halt"
+        if _evaluate(db, cfg, brokers, chunk, moves, log, state=state, dirty=dirty) == "halt":
+            return "halt"
+    return None
+
+
+def _status(games, what: str, scan_errors) -> str:
+    feed = polymarket._feed
+    return (f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
+            f"{sum(len(g.contracts) for g in games):,} contracts · {what}"
+            + (" · Polymarket feed DOWN" if feed is not None and not feed.alive() else "")
+            + (" · " + "; ".join(scan_errors) if scan_errors else ""))
 
 
 def market_key(c: Contract) -> str:
@@ -938,6 +990,13 @@ def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None =
         for d in (state["due"], state["last_eval"]):
             for gk in [k for k in d if k not in live]:
                 d.pop(gk)
+    if cfg.maker and cfg.scan_thread and state is not None:
+        # Event trigger, maker: the scan is applied without one long block. The quotes follow the new contract
+        # objects and are checked against the live books first, then the games are priced in slices.
+        log(_status(games, f"HALTED ({_halted}): held legs only" if _halted else "maker", snap.errors))
+        if not _halted and maker.sync(db, cfg, brokers, games, log) == "halt":
+            return "halt"
+        return _evaluate_sliced(db, cfg, brokers, games, moves, log, state=state)
     return _evaluate(db, cfg, brokers, games, moves, log, scan_errors=snap.errors, state=state)
 
 
@@ -968,11 +1027,7 @@ def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=Non
         # No taker arbs in maker mode (and nothing at all while halted): the arb search over every game was done
         # only for the count in the status line. Skipped: it ran on the trading thread on every check.
         if scan_errors is not None:
-            log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
-                f"{sum(len(g.contracts) for g in games):,} contracts · "
-                + (f"HALTED ({_halted}): held legs only" if _halted else "maker")
-                + (" · Polymarket feed DOWN" if feed is not None and not feed.alive() else "")
-                + (" · " + "; ".join(scan_errors) if scan_errors else ""))
+            log(_status(games, f"HALTED ({_halted}): held legs only" if _halted else "maker", scan_errors))
         if _halted:
             return None
         return maker.step(db, cfg, brokers, games, log, full=scan_errors is not None)
