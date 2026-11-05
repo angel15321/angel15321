@@ -28,6 +28,7 @@ import datetime as dt
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -130,6 +131,10 @@ class Config:
     rescue: bool = True
     rescue_edge: float = 0.01         # $ per pair a late hedge must lock
     rescue_sell: float = 0.03         # $ per contract a sell-back must clear over the cost (after its fee)
+    # --trigger event: full scans (market lists, game state, a first copy of every book) run on their own thread and
+    # the trading thread only applies the finished snapshot. False (--scan-inline) = the scan blocks the trading
+    # thread again, as until 11-05.
+    scan_thread: bool = True
 
 
 # ---------------------------------------------------------------- helpers
@@ -555,6 +560,85 @@ class Trigger:
         return d
 
 
+SCAN_KEY = "\x00scan"    # what the scan thread marks on the Trigger when a snapshot is ready (no market has this key)
+SCAN_STALE_S = 10.0      # s without a finished full scan before the game list is dropped and every quote pulled
+_halted = ""             # why trading stopped (set by _loop); the process may stay up only to watch held legs
+
+
+def _window(cfg: Config, days: float) -> float:
+    """Days ahead a full scan looks. In-play scans only fetch games starting within 30 min (Kalshi kickoffs are
+    estimates, so the exact in-progress filter is applied in _tick)."""
+    return max(cfg.maker_horizon_h / 24, 0.02) if cfg.maker else (min(days, 0.02) if cfg.in_play_only else days)
+
+
+class ScanThread:
+    """Full scans off the trading thread.
+
+    A full scan is network (market lists, events, first book reads) plus building a few thousand contracts: on the
+    trading thread it kept quotes from being pulled while it ran (11-05 #58: quoted off Kalshi 0.59, Kalshi at 0.67
+    when the fill came). Here it runs on its own thread, once per `interval`; the trading thread takes the finished
+    Snapshot (new Game / Contract objects nobody else holds) and re-reads every book from the live feeds before it
+    prices anything. `wake` is called when a snapshot is ready."""
+
+    def __init__(self, cfg: Config, days: float, interval: float, wake=None):
+        self.cfg, self.days, self.interval, self.wake = cfg, days, max(1.0, interval), wake
+        self._lock = threading.Lock()
+        self._snap = None
+        self._stop = threading.Event()
+        self.started_at = time.time()
+        self.done_at = 0.0           # when the last scan finished
+        self.took = 0.0              # s the last scan ran
+        self.scans = 0
+        self.error = ""              # the last scan's error ("" after a good one)
+        self._thread = threading.Thread(target=self._run, name="scan", daemon=True)
+
+    def start(self) -> None:
+        # The scan thread's Python work (building a few thousand contracts) shares the interpreter lock with the
+        # trading thread: ask it to hand the lock over after 1 ms instead of the default 5.
+        sys.setswitchinterval(0.001)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def ready(self) -> bool:
+        return self._snap is not None
+
+    def take(self):
+        """The newest finished snapshot not taken yet, or None."""
+        with self._lock:
+            snap, self._snap = self._snap, None
+        return snap
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                snap = scanner.snapshot(_window(self.cfg, self.days), sports=self.cfg.sports)
+                with self._lock:
+                    self._snap = snap
+                    self.took, self.done_at, self.error = time.time() - t0, time.time(), ""
+                    self.scans += 1
+            except Exception as e:       # the trading thread reports it; a run of them drops the game list
+                self.error = f"{type(e).__name__}: {e}"[:200]
+            if self.wake is not None:
+                try:
+                    self.wake()
+                except Exception:
+                    pass
+            self._stop.wait(max(0.0, self.interval - (time.time() - t0)))
+
+
+def held_legs(db, mode: str) -> int:
+    """Open one-sided positions the held-leg watcher (rescue.py) can still close. Dust is not worth staying up for."""
+    return db.execute("SELECT COUNT(*) FROM trades WHERE mode=? AND status='open' AND outcome IN "
+                      "('exposed','partial','error')", (mode,)).fetchone()[0]
+
+
+def _timing() -> dict:
+    return {"scan": [], "apply": [], "busy": 0.0, "block": 0.0, "at": time.time()}
+
+
 def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool = False, log=print):
     """Full scan every `interval` s (market lists, game state, balances, settlement). With --trigger event,
     between scans every book change re-checks just its game (at most every cfg.event_gap), and an arb trades
@@ -581,10 +665,32 @@ def run(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool
 
 
 def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool, log, state: dict, trig, mode: str):
+    global _halted
+    _halted = ""
+    scan = None
+    if trig is not None and not once and cfg.scan_thread:
+        scan = ScanThread(cfg, days, interval, wake=lambda: trig.mark(SCAN_KEY))
+        scan.start()
+        log("Full scans run on their own thread; the trading thread applies each finished one (--scan-inline = as before)")
+    try:
+        return _loop_on(db, cfg, brokers, days, interval, once, log, state, trig, mode, scan)
+    finally:
+        _halted = ""                  # the flag belongs to this run of the loop
+        if scan is not None:
+            scan.stop()
+
+
+def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once: bool, log, state: dict, trig,
+             mode: str, scan) -> None:
+    global _halted
     next_scan = 0.0
     maker_at = time.time()
+    scan_said = ""                    # the scan-thread problem already logged
+    watching = False                  # halted, staying up for held legs
+    tm = state.setdefault("timing", _timing())
+    busy_from = time.time()
     while True:
-        if time.time() >= next_scan:
+        if time.time() >= next_scan or (scan is not None and scan.ready()):
             if os.path.exists(cfg.kill_file):
                 log(f"Kill switch: '{cfg.kill_file}' exists — stopping.")
                 return
@@ -593,28 +699,70 @@ def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bo
             except Exception as e:
                 log(f"! settle error: {e}")
             streak = recent_failures(db, mode, cfg.max_failures)
-            if streak >= cfg.max_failures:
-                log(f"Halting: last {streak} trades failed to hedge. Review the log, then run again.")
+            if streak >= cfg.max_failures and not _halted:
+                # Halted = no new quote or arb until `arbscan ack` + a restart. Until 11-05 the process also EXITED
+                # here, which ended rescue.py exactly when there were held legs to watch (11-05 #53: 0.74-0.96 for two
+                # minutes after a 0.54 entry). Now it stays up while a one-sided position is open, then stops.
+                _halted = f"last {streak} trades failed to hedge"
+                n = held_legs(db, mode) if cfg.rescue and not once else 0
+                log(f"Halting: last {streak} trades failed to hedge. Review the log, then run again."
+                    + (f" No new quotes or arbs; still watching {n} held leg(s) for a profitable exit." if n else ""))
                 if mode == "live":
-                    notify.push(f"🔴 HALTED: the last {streak} trades failed to hedge. The bot is DOWN and stays down "
-                                "until `arbscan ack` + a restart.", urgent=True)
-                return
+                    notify.push(f"🔴 HALTED: the last {streak} trades failed to hedge. No new quotes"
+                                + (f"; still watching {n} held leg(s) for a profitable exit, then it stops" if n
+                                   else "; the bot is DOWN")
+                                + ". It stays halted until `arbscan ack` + a restart.", urgent=True)
+            if _halted:
+                if cfg.maker and maker.STATE.quotes:
+                    maker.shutdown(db, cfg, brokers, log)             # nothing rests while halted (repeats until gone)
+                n = held_legs(db, mode) if cfg.rescue and not once else 0
+                if not n and not (cfg.maker and maker.STATE.quotes):
+                    if watching:
+                        log("Halted: no held leg left to watch — stopping.")
+                    return
+                watching = True
             t0 = time.time()
-            try:
-                _tick(db, cfg, brokers, days, log, state if trig is not None else None)
-            except Exception as e:  # keep the bot alive across transient API errors
-                log(f"! scan error: {type(e).__name__}: {e}")
+            snap = scan.take() if scan is not None else None
+            if scan is None or snap is not None:
+                scan_said = ""
+                try:
+                    _tick(db, cfg, brokers, days, log, state if trig is not None else None, snap=snap)
+                except Exception as e:  # keep the bot alive across transient API errors
+                    log(f"! scan error: {type(e).__name__}: {e}")
+                if scan is not None:
+                    tm["scan"].append(scan.took)
+                    tm["apply"].append(time.time() - t0)
+            else:
+                # the watchdog fired with no new snapshot: say why once, and never trade on an old game list
+                idle = time.time() - max(scan.done_at, scan.started_at)
+                if scan.error and scan.error != scan_said:
+                    scan_said = scan.error
+                    log(f"! scan error: {scan.error}")
+                if idle > SCAN_STALE_S and state.get("games"):
+                    log(f"! no full scan for {idle:.0f}s ({scan.error or 'still running'}): game list dropped and "
+                        "quotes pulled until scans are back")
+                    state["games"], state["index"] = [], {}
+                    if cfg.maker and not _halted:
+                        try:
+                            if maker.step(db, cfg, brokers, [], log, full=True) == "halt":
+                                t0 = -1e9
+                        except Exception as e:
+                            log(f"! maker error: {type(e).__name__}: {e}")
             if once:
                 return
-            next_scan = t0 + max(1.0, interval)
+            # with the scan thread this timer is only a watchdog: a finished snapshot wakes the loop itself
+            next_scan = t0 + (max(1.0, interval) if scan is None else max(2.0, 2 * interval))
             if trig is not None and time.time() - state["stats_at"] >= 60:
                 s = state["stats"]
-                log(f"  event trigger, last {time.time() - state['stats_at']:.0f}s: {s['wakes']:,} wakes · "
+                span = time.time() - state["stats_at"]
+                log(f"  event trigger, last {span:.0f}s: {s['wakes']:,} wakes · "
                     f"{s['evals']:,} game checks · {s['seen']} arbs seen · {s['blips']} gone within "
                     f"{cfg.confirm_s * 1000:.0f} ms · {s['confirmed']} confirmed · "
                     f"{s.get('pm_skipped', 0)} stale-PM skipped")
+                log(timing_text(tm, time.time()))
                 state["stats"] = {k: 0 for k in s}
                 state["stats_at"] = time.time()
+                tm.update(_timing())
             if cfg.maker and time.time() - maker_at >= 60:
                 log(maker.stats_text())
                 maker_at = time.time()
@@ -631,12 +779,31 @@ def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bo
         due = min([next_scan] + list(state["due"].values()))
         if cfg.maker and maker.STATE.quotes:
             due = min([due] + [q.polled_at + cfg.maker_poll for q in maker.STATE.quotes.values()])
-        trig.event.wait(max(0.0, due - time.time()))
+        t_wait = time.time()
+        tm["busy"] += t_wait - busy_from
+        tm["block"] = max(tm["block"], t_wait - busy_from)
+        trig.event.wait(max(0.0, due - t_wait))
+        busy_from = time.time()
         try:
             if _on_events(db, cfg, brokers, state, trig.take(), log) == "halt":
                 next_scan = 0.0                          # the halt check at the top of the loop reports it
         except Exception as e:
             log(f"! event error: {type(e).__name__}: {e}")
+
+
+def timing_text(tm: dict, now: float) -> str:
+    """The trading thread's own latency for the log: how long one pass of the loop kept it from the next book
+    change (a quote cannot be pulled while it is busy), and what the scans cost on and off it."""
+    span = max(1e-9, now - tm["at"])
+    out = (f"  trading thread, last {span:.0f}s: busy {100 * tm['busy'] / span:.0f}% of the time · longest block "
+           f"{tm['block'] * 1000:.0f} ms")
+    if tm["scan"]:
+        sc, ap = tm["scan"], tm["apply"]
+        out += (f" · {len(ap)} scans applied in {1000 * sum(ap) / len(ap):.0f} ms avg / {1000 * max(ap):.0f} ms max"
+                f" · scan thread {1000 * sum(sc) / len(sc):.0f} ms avg / {1000 * max(sc):.0f} ms max (not on this thread)")
+    else:
+        out += " · scans inline (on this thread)"
+    return out
 
 
 def _on_events(db, cfg: Config, brokers: dict, state: dict, keys: set[str], log) -> str | None:
@@ -745,12 +912,10 @@ def startup_balances(brokers: dict, tries: int = 5, wait: float = 2.0, log=print
             time.sleep(wait * (i + 1))
 
 
-def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None = None):
-    mode = "live" if cfg.live else "dry"
-    # In-play scans only fetch games starting within 30 min (Kalshi kickoffs are
-    # estimates, so the exact in-progress filter is applied below).
-    window = max(cfg.maker_horizon_h / 24, 0.02) if cfg.maker else (min(days, 0.02) if cfg.in_play_only else days)
-    snap = scanner.snapshot(window, sports=cfg.sports)
+def _tick(db, cfg: Config, brokers: dict, days: float, log, state: dict | None = None, snap=None):
+    """One full scan applied: `snap` is a Snapshot the scan thread finished, else the scan runs here."""
+    if snap is None:
+        snap = scanner.snapshot(_window(cfg, days), sports=cfg.sports)
     now = dt.datetime.now(dt.timezone.utc)
     moves = _moves(snap.games)
     if cfg.maker:
@@ -792,12 +957,25 @@ def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=Non
         # Re-read them from the feed now: memory only, no network.
         polymarket.refresh([c for g in games for c in g.contracts if c.venue == "Polymarket"])
     if kalshi._feed is not None and kalshi._feed.alive():
-        # same for Kalshi when its books are live (otherwise they are this scan's REST reads)
-        kalshi.refresh([c for g in games for c in g.contracts if c.venue == "Kalshi"])
+        # same for Kalshi when its books are live (otherwise they are this scan's REST reads). Feed only: a market
+        # the feed has no book for yet keeps the scan's copy (and its age) instead of a REST read on this thread.
+        kalshi.refresh([c for g in games for c in g.contracts if c.venue == "Kalshi"], rest=False)
     try:
         rescue.check(db, cfg, brokers, games, log)      # held legs first: a profitable exit can be gone in seconds
     except Exception as e:
         log(f"! held-leg check error: {type(e).__name__}: {e}")
+    if cfg.maker or _halted:
+        # No taker arbs in maker mode (and nothing at all while halted): the arb search over every game was done
+        # only for the count in the status line. Skipped: it ran on the trading thread on every check.
+        if scan_errors is not None:
+            log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
+                f"{sum(len(g.contracts) for g in games):,} contracts · "
+                + (f"HALTED ({_halted}): held legs only" if _halted else "maker")
+                + (" · Polymarket feed DOWN" if feed is not None and not feed.alive() else "")
+                + (" · " + "; ".join(scan_errors) if scan_errors else ""))
+        if _halted:
+            return None
+        return maker.step(db, cfg, brokers, games, log, full=scan_errors is not None)
     arbs, _ = engine.find(games, min_roi=cfg.min_roi, cross_venue_only=cfg.cross_venue_only)
     arbs = [o for o in engine.non_overlapping(arbs) if o.max.profit >= cfg.min_profit]
     # Kalshi books are REST snapshots: their age IS how stale they are. A Polymarket book is the feed's latest
@@ -813,8 +991,6 @@ def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=Non
         log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
             f"{sum(len(g.contracts) for g in games):,} contracts · {len(fresh)} arb(s) ≥ {cfg.min_roi * 100:.2f}%"
             + stale_note + feed_note + (" · " + "; ".join(scan_errors) if scan_errors else ""))
-    if cfg.maker:
-        return maker.step(db, cfg, brokers, games, log, full=scan_errors is not None)
     # which venue of each pair just moved: the OTHER one holds the stale quote and is leg 1 (first_leg)
     changed_of = {o.key: {x.venue for x in (o.a, o.b) if market_key(x) in dirty} for o in fresh} if dirty else {}
     if state is not None:

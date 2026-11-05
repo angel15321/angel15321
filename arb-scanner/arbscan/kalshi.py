@@ -98,23 +98,26 @@ def _pair(yes_bids: list[tuple[float, float]], no_bids: list[tuple[float, float]
     return yes, no
 
 
-def fetch_books(tickers: list[str]) -> dict[str, tuple[Book, Book]]:
+def fetch_books(tickers: list[str], rest: bool = True) -> dict[str, tuple[Book, Book]]:
     """ticker -> (YES book, NO book). Kalshi returns bids only; a YES ask at
-    p is a NO bid at 1-p and vice versa."""
+    p is a NO bid at 1-p and vice versa. rest=False: live-feed books only, no network (a ticker the feed has no
+    book for is left out)."""
     out: dict[str, tuple[Book, Book]] = {}
-    rest = list(tickers)
+    todo = list(tickers)
     if _feed is not None:
         _feed.want(tickers)
     if _feed is not None and _feed.alive():
-        now, rest = time.time(), []
+        now, todo = time.time(), []
         for t in tickers:
             b = _feed.get(t)
             if b is None:
-                rest.append(t)                    # just subscribed / resyncing: one REST read this scan
+                todo.append(t)                    # just subscribed / resyncing: one REST read this scan
             else:
                 out[t] = _pair(*b.levels(), now)  # a live book is current as of this read
-    for i in range(0, len(rest), 100):
-        chunk = rest[i:i + 100]
+    if not rest:
+        return out
+    for i in range(0, len(todo), 100):
+        chunk = todo[i:i + 100]
         data = http.get(f"{API}/markets/orderbooks", {"tickers": chunk})
         now = time.time()
         for ob in data.get("orderbooks", []):
@@ -214,8 +217,9 @@ def settlement(ticker: str) -> float | None:
     return 1.0 if r == "yes" else 0.0 if r == "no" else None
 
 
-def refresh(contracts: list[Contract]) -> None:
-    books = fetch_books(sorted({c.ref["ticker"] for c in contracts}))
+def refresh(contracts: list[Contract], rest: bool = True) -> None:
+    tickers = sorted({c.ref["ticker"] for c in contracts})
+    books = fetch_books(tickers) if rest else fetch_books(tickers, rest=False)
     for c in contracts:
         if c.ref["ticker"] in books:
             yes, no = books[c.ref["ticker"]]

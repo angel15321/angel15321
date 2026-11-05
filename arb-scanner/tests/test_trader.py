@@ -300,6 +300,7 @@ class SafetyTests(Base):
 
     def test_halts_after_failed_hedges(self):
         self.cfg.on_fail = "hold"
+        self.cfg.rescue = False            # no held-leg watcher: a halt stops the process at once (as until 11-05)
         self._fail_twice()
         with mock.patch("arbscan.trader._tick") as tick:
             trader.run(self.db, self.cfg, self.paper, days=1, interval=0, **QUIET)

@@ -56,6 +56,8 @@ MODIFY_WAIT = 1.5        # s: a modify is applied a moment after its (empty) rep
 SWAP_AGE = 30.0          # s: a quote must have rested this long before a better pair elsewhere may replace it
 ROOM_SLACK = 1.15        # new quotes are sized into room / this, so a re-price a tick or two up still fits the room
 STOP_TRIES = 4           # cancel passes on the way out (each waits up to 1.5 s per quote; systemd allows 20 s)
+SUSPECT_S = 30.0         # s a quote whose post came back as an ERROR is looked for on Polymarket (the exchange
+                         # processes or rejects an order within 5 s of receiving it; our HTTP timeout is 15 s)
 
 
 def connect(db) -> None:
@@ -105,6 +107,9 @@ class State:
     modify_ok: bool = True    # False after a modify that did not take: re-price by cancel + post this run
     modify_checks: int = 0
     modify_slow: int = 0      # slow modifies in a row (accepted, not applied within MODIFY_WAIT)
+    ids: set = field(default_factory=set)          # every order id tracked this run (resting or closed)
+    suspects: list = field(default_factory=list)   # posts that came back as an error: may rest all the same
+    sweep_at: float = 0.0
     stats: dict = field(default_factory=lambda: {"quotable": 0, "posted": 0, "pulled": 0, "repriced": 0,
                                                  "modified": 0, "fills": 0})
 
@@ -335,8 +340,8 @@ def step(db, cfg, brokers, games, log, full: bool = False):
     # 3. an empty slot takes the best pair of a game we are not quoting yet (one new post per step)
     if now - s.last_post < cfg.maker_reprice / max(1, slots):
         return None
-    games_used = {q.game_key for q in s.quotes.values()}
-    ks_used = {q.k_id for q in s.quotes.values()}
+    games_used = {q.game_key for q in s.quotes.values()} | {sp["cand"].game.key for sp in s.suspects}
+    ks_used = {q.k_id for q in s.quotes.values()} | {sp["cand"].k.id for sp in s.suspects}
     n_live = sum(q.live for q in s.quotes.values())
     free = [c for c in cands if c.game.key not in games_used and c.k.id not in ks_used and c.key not in
             {q.key for q in s.quotes.values()} and not (c.live and n_live >= cfg.maker_live_quotes)]
@@ -403,7 +408,6 @@ def _unsafe(cfg, q: Quote, seen: bool, now: float, now_dt) -> str:
 
 def post(db, cfg, brokers, c: Cand, log):
     s = STATE
-    mode = "live" if cfg.live else "dry"
     s.last_post = time.time()
     f = brokers["Polymarket"].post(c.pm, c.qty, c.price)
     if f.status != "resting" or not f.order_id:
@@ -414,20 +418,81 @@ def post(db, cfg, brokers, c: Cand, log):
             log(f"  ! MAKER PAUSED: {s.paused}. Fix, then restart.")
         if f.order_id:                         # an id with no resting state: make sure it is gone
             _cancel(brokers, c.pm, f.order_id)
+        elif f.status == "error" and "HTTP 4" not in (f.error or ""):
+            # No reply we can read (a timeout, a 5xx; a 4xx IS an answer: refused): the exchange may have taken the
+            # order all the same, and then it rests with no id here -- nothing would ever cancel or hedge it. Look
+            # for it (poll -> _sweep).
+            s.suspects.append({"cand": c, "at": time.time(),
+                               "intent": "ORDER_INTENT_BUY_LONG" if c.pm.ref.get("side") == "long"
+                               else "ORDER_INTENT_BUY_SHORT"})
+            log(f"    looking for it on Polymarket for {SUSPECT_S:g}s (open orders + the order stream); no new quote "
+                "on this game meanwhile")
         return None
     s.rejects = 0
-    now = time.time()
-    db.execute("INSERT OR REPLACE INTO quotes (order_id, mode, posted_at, game, kickoff, opp_key, pm, k, price, qty, "
-               "k_ask, guaranteed, filled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
-               (f.order_id, mode, now, c.game.title, c.game.start.isoformat() if c.game.start else None, c.key,
-                _snap(c.pm), _snap(c.k), c.price, c.qty, c.k_ask, c.guaranteed))
-    db.commit()
-    s.quotes[f.order_id] = Quote(f.order_id, c.key, c.pm.id, c.k.id, c.game.key, c.game.title, c.price, c.qty,
-                                 c.k_ask, c.guaranteed, now, now, now, c.pm, c.k, c.game, c.live)
+    _track(db, cfg, c, f.order_id)
     s.stats["posted"] += 1
     log(f"  ◷ QUOTE{' LIVE' if c.live else ''} {c.game.title}: bid {c.pm.label} @ {c.price:.2f} x{c.qty:g} on Polymarket; hedge "
         f"{c.k.label} @ {c.k_ask:.2f} on Kalshi; edge {c.edge * 100:.1f} c/pair after fees "
         f"[{len(s.quotes)}/{max(1, cfg.maker_quotes)} resting]")
+    return None
+
+
+def _track(db, cfg, c: Cand, oid: str, posted_at: float | None = None) -> Quote:
+    """Write the quote to the ledger and start following it."""
+    s = STATE
+    now = time.time()
+    db.execute("INSERT OR REPLACE INTO quotes (order_id, mode, posted_at, game, kickoff, opp_key, pm, k, price, qty, "
+               "k_ask, guaranteed, filled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
+               (oid, "live" if cfg.live else "dry", posted_at or now, c.game.title,
+                c.game.start.isoformat() if c.game.start else None, c.key, _snap(c.pm), _snap(c.k), c.price, c.qty,
+                c.k_ask, c.guaranteed))
+    db.commit()
+    q = Quote(oid, c.key, c.pm.id, c.k.id, c.game.key, c.game.title, c.price, c.qty, c.k_ask, c.guaranteed,
+              posted_at or now, now, now, c.pm, c.k, c.game, c.live)
+    s.quotes[oid] = q
+    s.ids.add(oid)
+    return q
+
+
+def _sweep(db, cfg, brokers, log, now: float):
+    """Find the order of a post that came back as an error. An order of ours that this run never tracked, on the
+    suspect's market and side -- still open (GET /v1/orders/open) or already seen by the private order stream, which
+    also catches one that filled before we looked -- is taken over as a quote and pulled at once: the cancel reports
+    what it filled, and that goes through the normal hedge path."""
+    s = STATE
+    if not s.suspects or now < s.sweep_at:
+        return None
+    s.sweep_at = now + cfg.maker_poll
+    unknown = {}
+    fn = getattr(brokers["Polymarket"], "open_orders", None)
+    if fn is not None:
+        try:
+            for o in fn() or []:
+                if o.get("id") and o["id"] not in s.ids:
+                    unknown[o["id"]] = o
+        except Exception as e:
+            log(f"! maker: open-orders read failed: {e}")
+    feed = polymarket._orders
+    if feed is not None:
+        first = min(sp["at"] for sp in s.suspects) - 1.0
+        for oid, (ts, o) in list(feed.orders.items()):
+            if oid not in s.ids and ts >= first:
+                unknown.setdefault(oid, o)
+    for sp in list(s.suspects):
+        c = sp["cand"]
+        hit = next((o for o in unknown.values() if o.get("marketSlug") == c.pm.ref.get("slug")
+                    and o.get("intent") == sp["intent"]), None)
+        if hit is not None:
+            s.suspects.remove(sp)
+            unknown.pop(hit["id"], None)
+            q = _track(db, cfg, c, hit["id"], posted_at=sp["at"])
+            log(f"  ! quote {hit['id']} ({c.game.title} {c.pm.label} @ {c.price:.2f}) WAS placed although its post "
+                "came back as an error: now tracked, pulling it")
+            if pull(db, cfg, brokers, q, "placed through an error reply", log) == "halt":
+                return "halt"
+        elif now >= sp["at"] + SUSPECT_S:
+            s.suspects.remove(sp)
+            log(f"  maker: no order found for the failed quote on {c.game.title} after {SUSPECT_S:g}s: it was not placed")
     return None
 
 
@@ -547,6 +612,8 @@ def poll(db, cfg, brokers, log, force: bool = False):
     s = STATE
     now = time.time()
     feed = polymarket._orders
+    if s.suspects and _sweep(db, cfg, brokers, log, now) == "halt":
+        return "halt"
     for q in list(s.quotes.values()):
         if q.dead:
             if force or now - q.polled_at >= cfg.maker_poll:
@@ -683,6 +750,15 @@ def shutdown(db, cfg, brokers, log) -> None:
     """Never leave a quote resting when the bot stops. A cancel that is not confirmed is sent again, up to STOP_TRIES
     passes: 11-05 01:08Z one pass left a quote 'may still be resting', and after a HALT (a clean exit systemd does not
     restart) nothing would come back to cancel it."""
+    if STATE.suspects:                          # a post that errored moments ago: one last look before leaving
+        STATE.sweep_at = 0.0
+        try:
+            _sweep(db, cfg, brokers, log, time.time())
+        except Exception as e:
+            log(f"! maker: could not look for a failed post on exit: {e}")
+        for sp in STATE.suspects:
+            log(f"! maker: a quote on {sp['cand'].game.title} ({sp['cand'].pm.label} @ {sp['cand'].price:.2f}) may "
+                "have been placed through an error reply -- check Polymarket for an open order")
     for _ in range(STOP_TRIES):
         for q in list(STATE.quotes.values()):
             try:
@@ -733,7 +809,28 @@ def recover(db, cfg, brokers, log) -> int:
         db.execute(f"INSERT INTO trades ({','.join(vals)}) VALUES ({','.join('?' * len(vals))})", list(vals.values()))
         db.commit()
         log(f"  ✖ maker: {vals['note']}")
+    _unknown_open(db, mode, brokers, log)
     return n
+
+
+def _unknown_open(db, mode: str, brokers, log) -> int:
+    """At start nothing of ours should rest. An order open on the account that the ledger has never seen is either a
+    quote that was placed through an error reply right before a crash, or someone else's (the account is shared):
+    it is reported, never cancelled here."""
+    fn = getattr(brokers["Polymarket"], "open_orders", None)
+    if fn is None:
+        return 0
+    try:
+        known = {r[0] for r in db.execute("SELECT order_id FROM quotes WHERE mode=?", (mode,))}
+        extra = [o for o in fn() or [] if o.get("id") and o["id"] not in known]
+    except Exception as e:
+        log(f"! maker: open-orders read failed at start: {e}")
+        return 0
+    for o in extra[:10]:
+        log(f"! maker: order {o['id']} is OPEN on Polymarket and not in this ledger: {o.get('marketSlug')} "
+            f"{str(o.get('intent', '')).replace('ORDER_INTENT_', '')} @ {(o.get('price') or {}).get('value')} "
+            f"x{o.get('quantity')} -- not touched (the account is shared); cancel it there if it is not yours")
+    return len(extra)
 
 
 def stats_text() -> str:

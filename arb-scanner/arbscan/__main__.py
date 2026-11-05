@@ -64,7 +64,8 @@ def cmd_run(a):
         maker_in_play=(tuple(a.sports) if a.maker_in_play == "all" else a.maker_in_play or ()),
         maker_live_edge=a.maker_live_edge_c / 100, maker_live_quotes=a.maker_live_quotes,
         rescue=not a.no_rescue, rescue_edge=a.rescue_edge_c / 100, rescue_sell=a.rescue_sell_c / 100,
-        maker_horizon_h=a.maker_horizon_h, maker_max_qty=a.maker_max_qty, maker_quotes=a.maker_quotes)
+        maker_horizon_h=a.maker_horizon_h, maker_max_qty=a.maker_max_qty, maker_quotes=a.maker_quotes,
+        scan_thread=not a.scan_inline)
     log = _log_to(a.log)
     try:
         brokers = trader.make_brokers(cfg, kalshi_demo=a.kalshi_demo)
@@ -244,6 +245,9 @@ def main(argv=None):
                    help="event trigger: re-check one game at most this often (default 50 ms)")
     r.add_argument("--confirm-ms", type=float, default=30,
                    help="event trigger: an arb must still be there this long after it first appears (default 30 ms)")
+    r.add_argument("--scan-inline", action="store_true",
+                   help="event trigger: run the full scan on the trading thread again (default: its own thread, so a "
+                        "scan never delays pulling a quote)")
     r.add_argument("--maker", action="store_true",
                    help="MAKER mode: rest one post-only Polymarket bid priced off Kalshi's ask and hedge on Kalshi when it "
                         "fills, instead of taking arbs. Pre-game only unless --maker-in-play")

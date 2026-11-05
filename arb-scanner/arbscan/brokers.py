@@ -166,6 +166,9 @@ class PaperBroker:
         q.update(price=limit, qty=qty)
         return True, ""
 
+    def open_orders(self) -> list[dict]:
+        return []
+
     def cancel(self, c: Contract, oid: str, wait: float = 0.0) -> dict:
         st = self.order_state(c, oid)
         q = getattr(self, "quotes", {}).get(oid)
@@ -457,6 +460,10 @@ class PolymarketBroker:
 
     def order_state(self, c: Contract, oid: str) -> dict:
         return self._state(c, self._req("GET", f"/v1/order/{oid}").get("order") or {})
+
+    def open_orders(self) -> list[dict]:
+        """Every open order on the account (raw: id, marketSlug, intent, price, quantity, cumQuantity, state)."""
+        return self._req("GET", "/v1/orders/open").get("orders") or []
 
     def cancel(self, c: Contract, oid: str, wait: float = 1.5) -> dict:
         """Cancel and read the final state (filled quantity included). {"error"} when the cancel failed."""

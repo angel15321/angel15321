@@ -21,11 +21,14 @@ def _throttle(url: str) -> None:
     gap = _MIN_INTERVAL.get(host)
     if not gap:
         return
+    # Take the next slot under the lock, wait for it outside: sleeping while holding the lock made every other
+    # thread (the trading thread included, once scans run on their own) queue behind the sleeper.
     with _lock:
-        wait = _last.get(host, 0) + gap - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        _last[host] = time.monotonic()
+        now = time.monotonic()
+        at = max(now, _last.get(host, 0) + gap)
+        _last[host] = at
+    if at > now:
+        time.sleep(at - now)
 
 
 def request(url: str, params=None, body=None, timeout: float = 20):

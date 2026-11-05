@@ -69,9 +69,21 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
   room the resting ones leave, so if all of them filled together the total still fits `--max-daily`.
 - **Fill:** seen on the private order stream (REST poll every 1 s as backup), hedged on Kalshi at once, the
   rest of the quote cancelled, then the usual hedge retries and sell-back-or-hold rule.
-- **Safety:** every quote is written to the `quotes` table before it is sent; quotes a crash left open are
-  cancelled at the next start (a fill meanwhile becomes an `error` row, which halts). Every exit cancels the
-  resting quote. Three refused quotes in a row pause maker mode.
+- **Safety:** every quote is written to the `quotes` table as soon as its id is known; quotes a crash left open
+  are cancelled at the next start (a fill meanwhile becomes an `error` row). Every exit cancels the resting
+  quotes, and a cancel that is not confirmed is sent again. Three refused quotes in a row pause maker mode.
+  A fill under one Kalshi contract cannot be hedged: it is booked as `dust`, which is not a failed hedge.
+- **A post that comes back as an error** (a timeout, a 5xx; a 4xx is a refusal) may have been placed all the
+  same. For 30 s the bot looks for an order of its own it never tracked on that market and side -- still open
+  (`GET /v1/orders/open`) or seen by the private order stream, which also catches one that already filled --
+  takes it over and pulls it; whatever it filled goes through the normal hedge path. No new quote on that
+  game meanwhile. At start, an open order the ledger does not know is reported, never cancelled (the
+  account may be shared).
+- **Speed:** with `--trigger event` the full scan (market lists, game state, first book reads) runs on its own
+  thread and the trading thread only applies the finished snapshot, re-reading every book from the live feeds
+  (never REST) before it prices anything; `--scan-inline` puts the scan back on the trading thread. If no scan
+  finishes for 10 s the game list is dropped and every quote pulled until scans are back. Every minute the log
+  shows `trading thread: busy N% · longest block M ms` -- the longest time a quote could not be pulled.
 - **Scope:** games starting within `--maker-horizon-h` (24 h). `--maker-in-play nhl,tennis,nba,nfl` (no value =
   every `--sports`) also quotes games in progress of those sports, with a bigger required edge
   (`--maker-live-edge-c`, 4¢ a pair), at most `--maker-live-quotes` (2) of the slots, and a pull on ANY Kalshi
@@ -167,6 +179,7 @@ reason to keep tennis `--in-play-only`.
 | Leg order | stale venue first in-play | `--leg1` |
 | Failed hedge → sell leg 1 back | unwind | `--on-fail hold` |
 | Halt after N failed hedges in a row | 2 | `--max-failures` |
+| While halted | no quotes, no arbs; stays up only while a held leg can still be closed at a profit, then exits | `--no-rescue` = exit at once |
 | Don't re-take the same pair for | 10 min | `--cooldown` |
 | Kill switch | create a file named `STOP` | `--kill-file` |
 | Balance check before every trade | always | |
