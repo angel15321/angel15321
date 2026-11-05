@@ -15,7 +15,7 @@ import json
 import signal
 import sys
 
-from . import engine, fees, kalshi, kalshiws, pmws, polymarket, report, scanner, trader
+from . import engine, fees, kalshi, kalshiws, notify, pmws, polymarket, report, scanner, trader
 
 
 def _log_to(path: str | None):
@@ -110,10 +110,13 @@ def cmd_run(a):
     # systemd stops the bot with SIGTERM: turn it into the Ctrl-C path so a resting quote is cancelled on the way out
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     log(f"Stop: Ctrl-C, or create a file named '{cfg.kill_file}' here. Ledger: {a.db}")
+    if cfg.live:
+        notify.start(log)           # hedge outcomes to Telegram, late and off the trading thread (notify.py)
     try:
         trader.run(db, cfg, brokers, a.days, a.interval, once=a.once, log=log)
     except KeyboardInterrupt:
         log("\nstopped.")
+    notify.flush()                  # the sender thread dies with the process: send what is queued (a halt line)
     log(trader.summary_text(trader.summary(db, "live" if cfg.live else "dry")))
 
 

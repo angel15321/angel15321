@@ -32,7 +32,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import engine, kalshi, maker, polymarket, rescue, scanner
+from . import engine, kalshi, maker, notify, polymarket, rescue, scanner
 from .brokers import Fill, floor_to, max_price_within
 from .model import Contract
 
@@ -448,6 +448,7 @@ def _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note="", lo
            "missed": "· MISSED", "error": "✖ ERROR"}[outcome]
     extra = f", locked +${locked:.2f}" if locked is not None else ""
     log(f"    {tag} {opp.game.title}: cash out ${cash_out:,.2f}{extra} — {note}")
+    notify.trade(vals)          # Telegram, queued only: sent ~30 s later by its own thread (notify.py)
     return vals
 
 
@@ -587,6 +588,9 @@ def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bo
             streak = recent_failures(db, mode, cfg.max_failures)
             if streak >= cfg.max_failures:
                 log(f"Halting: last {streak} trades failed to hedge. Review the log, then run again.")
+                if mode == "live":
+                    notify.push(f"🔴 HALTED: the last {streak} trades failed to hedge. The bot is DOWN and stays down "
+                                "until `arbscan ack` + a restart.", urgent=True)
                 return
             t0 = time.time()
             try:

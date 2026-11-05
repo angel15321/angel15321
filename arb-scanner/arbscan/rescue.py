@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import time
 
-from . import engine
+from . import engine, notify
 from .brokers import Fill, floor_to, max_price_within
 
 _next_try: dict[int, float] = {}       # trade id -> earliest next attempt (a miss waits RETRY_S)
@@ -117,6 +117,10 @@ def _late_hedge(db, r, brokers, held, other, residual, cost, guaranteed, cfg, lo
     db.commit()
     log(f"    ✔ LATE HEDGE #{r['id']} {r['game']}: {f.qty:g} {other.label} @ {f.avg_price:.3f} on {other.venue}"
         + (f" -- locked +${locked:.2f}" if locked is not None else f" -- {left:g} still held"))
+    if r["mode"] == "live":
+        notify.push(f"🛡 LATE HEDGE FILLED #{r['id']} · {r['game']} · {f.qty:g} {other.label} @ "
+                    f"{notify.cents(f.avg_price)} on {other.venue}"
+                    + (f" · locked {notify.money(locked)}" if locked is not None else f" · {left:g} still held"))
     return 1
 
 
@@ -149,6 +153,9 @@ def _sell_back(db, r, brokers, held, residual, cost, cfg, log, fills, a_held, q_
     db.commit()
     log(f"    ✔ SOLD BACK #{r['id']} {r['game']}: {f.qty:g} {held.label} @ {f.avg_price:.3f} on {held.venue}"
         + (f" -- realized +${pnl:.2f}" if pnl is not None else ""))
+    if r["mode"] == "live":
+        notify.push(f"✔ SOLD BACK #{r['id']} · {r['game']} · {f.qty:g} {held.label} @ {notify.cents(f.avg_price)} on "
+                    f"{held.venue}" + (f" · realized {notify.money(pnl)}" if pnl is not None else ""))
     return 1
 
 
