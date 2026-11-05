@@ -426,5 +426,69 @@ class NhlCodeTests(unittest.TestCase):
         self.assertEqual(split_teams("TBMIN", "nhl"), ("TB", "MIN"))
 
 
+class RescueTests(Base):
+    """The 11-05 #53 shape: a quote filled, Kalshi had already run, the leg is held -- then the match swings back."""
+
+    def _held(self):
+        from arbscan import rescue
+        rescue._next_try.clear()
+        g, pm, k = pair()
+        maker.step(self.db, self.cfg, self.paper, [g], full=True, **QUIET)
+        k.book.asks = [(0.70, 100)]                            # Kalshi ran before we saw the fill
+        sold_into = Book(asks=[(0.39, 50)], bids=[(0.30, 100)], fetched_at=time.time())
+        with mock.patch.object(trader, "live_book", return_value=sold_into):
+            maker.poll(self.db, self.cfg, self.paper, force=True, **QUIET)
+        row = self.db.execute("SELECT * FROM trades").fetchone()
+        self.assertEqual(row["outcome"], "exposed")
+        return g, pm, k, row
+
+    def test_late_hedge_locks_a_profit_when_kalshi_comes_back(self):
+        from arbscan import rescue
+        g, pm, k, row = self._held()
+        k.book.asks = [(0.45, 100)]                            # Under bought at 0.39 + Over now 0.45 (+fee) < 1
+        logs = []
+        self.assertEqual(rescue.check(self.db, self.cfg, self.paper, [g], logs.append), 1)
+        r = self.db.execute("SELECT * FROM trades").fetchone()
+        self.assertEqual(r["outcome"], "hedged")
+        self.assertAlmostEqual(r["qty_a"], 20)
+        self.assertAlmostEqual(r["qty_b"], 20)
+        self.assertGreater(r["locked_profit"], 1.0)            # ~14c a pair on 20 pairs
+        self.assertIn("LATE HEDGE", r["note"])
+        self.assertEqual(trader.recent_failures(self.db, "dry", 2), 0)   # no longer a failed hedge
+
+    def test_sell_back_at_a_profit(self):
+        from arbscan import rescue
+        g, pm, k, row = self._held()
+        pm.book.bids = [(0.50, 100)]                           # our 0.39 leg is now bid 0.50; Kalshi still dear
+        self.assertEqual(rescue.check(self.db, self.cfg, self.paper, [g], QUIET["log"]), 1)
+        r = self.db.execute("SELECT * FROM trades").fetchone()
+        self.assertEqual((r["outcome"], r["status"]), ("sold", "closed"))
+        self.assertGreater(r["pnl"], 1.5)                      # 11c on 20
+        self.assertEqual(trader.recent_failures(self.db, "dry", 2), 0)
+
+    def test_no_profitable_exit_keeps_holding(self):
+        from arbscan import rescue
+        g, pm, k, row = self._held()
+        pm.book.bids = [(0.40, 100)]                           # +1c over cost: under the 3c sell margin
+        k.book.asks = [(0.60, 100)]                            # 0.39 + 0.60 + fee > 0.99
+        self.assertEqual(rescue.check(self.db, self.cfg, self.paper, [g], QUIET["log"]), 0)
+        self.assertEqual(self.db.execute("SELECT outcome FROM trades").fetchone()[0], "exposed")
+
+    def test_takes_the_better_exit(self):
+        from arbscan import rescue
+        g, pm, k, row = self._held()
+        k.book.asks = [(0.50, 100)]                            # hedge locks ~9c a pair
+        pm.book.bids = [(0.55, 100)]                           # selling clears ~16c a contract: better
+        rescue.check(self.db, self.cfg, self.paper, [g], QUIET["log"])
+        self.assertEqual(self.db.execute("SELECT outcome FROM trades").fetchone()[0], "sold")
+
+    def test_off_switch(self):
+        from arbscan import rescue
+        g, pm, k, row = self._held()
+        k.book.asks = [(0.45, 100)]
+        cfg = trader.Config(maker=True, max_per_trade=20, min_profit=0.0, rescue=False)
+        self.assertEqual(rescue.check(self.db, cfg, self.paper, [g], QUIET["log"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

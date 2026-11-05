@@ -32,7 +32,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import engine, kalshi, maker, polymarket, scanner
+from . import engine, kalshi, maker, polymarket, rescue, scanner
 from .brokers import Fill, floor_to, max_price_within
 from .model import Contract
 
@@ -126,6 +126,10 @@ class Config:
     maker_max_qty: float = 0.0        # contracts per quote cap (0 = only the $ caps)
     maker_max_rejects: int = 3        # Polymarket refusing this many quotes in a row pauses maker mode
     maker_quotes: int = 3             # quotes resting at once (one per game); the day room is split across them
+    # held-leg watcher (rescue.py): a one-sided position is closed as soon as it can be closed at a profit
+    rescue: bool = True
+    rescue_edge: float = 0.01         # $ per pair a late hedge must lock
+    rescue_sell: float = 0.03         # $ per contract a sell-back must clear over the cost (after its fee)
 
 
 # ---------------------------------------------------------------- helpers
@@ -779,6 +783,10 @@ def _evaluate(db, cfg: Config, brokers: dict, games, moves, log, scan_errors=Non
     if kalshi._feed is not None and kalshi._feed.alive():
         # same for Kalshi when its books are live (otherwise they are this scan's REST reads)
         kalshi.refresh([c for g in games for c in g.contracts if c.venue == "Kalshi"])
+    try:
+        rescue.check(db, cfg, brokers, games, log)      # held legs first: a profitable exit can be gone in seconds
+    except Exception as e:
+        log(f"! held-leg check error: {type(e).__name__}: {e}")
     arbs, _ = engine.find(games, min_roi=cfg.min_roi, cross_venue_only=cfg.cross_venue_only)
     arbs = [o for o in engine.non_overlapping(arbs) if o.max.profit >= cfg.min_profit]
     # Kalshi books are REST snapshots: their age IS how stale they are. A Polymarket book is the feed's latest

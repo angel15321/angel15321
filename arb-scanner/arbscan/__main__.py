@@ -63,6 +63,7 @@ def cmd_run(a):
         maker=a.maker, maker_edge=a.maker_edge_c / 100, maker_ttl=a.maker_ttl,
         maker_in_play=(tuple(a.sports) if a.maker_in_play == "all" else a.maker_in_play or ()),
         maker_live_edge=a.maker_live_edge_c / 100, maker_live_quotes=a.maker_live_quotes,
+        rescue=not a.no_rescue, rescue_edge=a.rescue_edge_c / 100, rescue_sell=a.rescue_sell_c / 100,
         maker_horizon_h=a.maker_horizon_h, maker_max_qty=a.maker_max_qty, maker_quotes=a.maker_quotes)
     log = _log_to(a.log)
     try:
@@ -90,6 +91,8 @@ def cmd_run(a):
         + (f" · trigger: every book change (confirm {cfg.confirm_s * 1000:.0f} ms, per game <= 1/{cfg.event_gap * 1000:.0f} ms)"
            if cfg.trigger == "event" else f" · trigger: scan every {max(1.0, a.interval):g}s")
         + f" · sports: {', '.join(cfg.sports)}"
+        + (f" · held legs: late hedge at >= {cfg.rescue_edge * 100:.0f} c/pair locked or sell back at >= "
+           f"{cfg.rescue_sell * 100:.0f} c/ct profit" if cfg.rescue else " · held legs: ride to settlement")
         + (f" · MAKER: up to {cfg.maker_quotes} post-only Polymarket bids (1/game), edge >= {cfg.maker_edge * 100:.1f} c/pair, hedge on Kalshi, "
            f"pre-game (<= {cfg.maker_horizon_h:g} h)"
            + (f" + IN-PLAY {', '.join(cfg.maker_in_play)} (edge >= {cfg.maker_live_edge * 100:.1f} c/pair, <= "
@@ -256,6 +259,12 @@ def main(argv=None):
     r.add_argument("--maker-quotes", type=int, default=3,
                    help="maker: quotes resting at once, one per game; the day's room is split across them (default 3)")
     r.add_argument("--maker-max-qty", type=float, default=0, help="maker: contracts per quote cap (default 0 = $ caps only)")
+    r.add_argument("--no-rescue", action="store_true",
+                   help="do not watch held (unhedged) legs for a profitable late hedge / sell-back")
+    r.add_argument("--rescue-edge-c", type=float, default=1.0,
+                   help="held leg: late-hedge when the pair then locks at least this many cents a pair (default 1)")
+    r.add_argument("--rescue-sell-c", type=float, default=3.0,
+                   help="held leg: sell it back when that clears at least this many cents a contract over cost (default 3)")
     r.add_argument("--max-book-age", type=float, default=1.0,
                    help="skip an arb priced from a Kalshi book older than this many seconds (default 1.0); Polymarket books are re-read from the live feed right before pricing")
     r.add_argument("--cross-venue-only", action="store_true")

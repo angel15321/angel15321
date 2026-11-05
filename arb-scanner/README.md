@@ -44,6 +44,10 @@ python -m arbscan run
    and retries up to 3 times; before each retry it checks the feed's in-memory book and stops when the quote is gone.
 6. **If the hedge fails,** it sells leg 1 back (`--on-fail unwind`, the default) or
    keeps it (`--on-fail hold`).
+   **A held leg is watched from then on** (`rescue.py`): on every scan / book event it is closed the moment that
+   locks a profit -- a late hedge of the other leg when the pair then makes at least 1¢ (`--rescue-edge-c`), or a
+   sell-back clearing at least 3¢ a contract over cost (`--rescue-sell-c`), whichever pays more. Never at a loss;
+   `--no-rescue` turns it off. (11-05 #53: held at 0.54, worth 0.74-0.96 a minute later, settled at -$4.32.)
 7. **Log and settle.** Every order goes into `trades.db` and `arbscan.log`. After
    each game it reads the official result and books the real P&L.
 
