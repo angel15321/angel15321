@@ -44,7 +44,10 @@ PAIR_TTL = 60            # s to reuse a sport's pairing (books are re-read every
 EVENT_TTL = 6 * 3600     # s to cache each event's market list
 LOOKBACK = dt.timedelta(hours=5)
 MAX_GAP = 0.15           # $: same side priced this far apart on the two venues = not the same game
-STOP = {"fc", "cf", "afc", "sc", "the", "de", "club", "university", "of", "state", "u"}
+# "state" is NOT a stop word: with it dropped, Michigan State == Michigan, Ohio State == Ohio, Kansas State == Kansas
+# (11-05 review). "St" / "St." reads as "state" on both venues instead, so "Ohio St." still pairs with "Ohio State".
+STOP = {"fc", "cf", "afc", "sc", "the", "de", "club", "university", "of", "u"}
+ALIAS = {"st": "state"}
 _pairs: dict[str, tuple[float, list]] = {}
 _events: dict[str, tuple[float, dict]] = {}
 dropped: dict[str, int] = {}   # sport -> games dropped by the price check at the last fetch (for the log / tests)
@@ -52,7 +55,7 @@ dropped: dict[str, int] = {}   # sport -> games dropped by the price check at th
 
 def norm(s: str) -> frozenset:
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
-    return frozenset(w for w in "".join(c if c.isalnum() else " " for c in s).split() if w not in STOP)
+    return frozenset(ALIAS.get(w, w) for w in "".join(c if c.isalnum() else " " for c in s).split() if w not in STOP)
 
 
 def same(a: frozenset, b: frozenset) -> bool:

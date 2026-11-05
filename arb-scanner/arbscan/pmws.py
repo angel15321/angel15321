@@ -230,7 +230,7 @@ class OrderFeed(BookFeed):
         o = hit[1]
         cum = float(o.get("cumQuantity") or 0)
         avg_yes = float((o.get("avgPx") or {}).get("value") or 0)
-        avg = (avg_yes if c.ref["side"] == "long" else 1 - avg_yes) if cum else 0.0
+        avg = (avg_yes if c.ref["side"] == "long" else 1 - avg_yes) if cum and avg_yes else 0.0   # no avgPx = unknown
         fee_v = (o.get("commissionNotionalTotalCollected") or {}).get("value")
         done = o.get("state") in ("ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED",
                                   "ORDER_STATE_EXPIRED")

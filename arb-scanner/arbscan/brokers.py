@@ -166,7 +166,7 @@ class PaperBroker:
         q.update(price=limit, qty=qty)
         return True, ""
 
-    def cancel(self, c: Contract, oid: str) -> dict:
+    def cancel(self, c: Contract, oid: str, wait: float = 0.0) -> dict:
         st = self.order_state(c, oid)
         q = getattr(self, "quotes", {}).get(oid)
         if q is not None and q["state"] == "resting":
@@ -433,7 +433,9 @@ class PolymarketBroker:
     def _state(self, c: Contract, o: dict) -> dict:
         cum = float(o.get("cumQuantity") or 0)
         avg_yes = float((o.get("avgPx") or {}).get("value") or 0)
-        avg = (avg_yes if c.ref["side"] == "long" else 1 - avg_yes) if cum else 0.0
+        # no avgPx on the order = price unknown (0.0: the caller falls back to the quote's own price). 1 - 0 on a
+        # short contract read as a $1.00 fill, which put the Kalshi hedge limit at 0.
+        avg = (avg_yes if c.ref["side"] == "long" else 1 - avg_yes) if cum and avg_yes else 0.0
         fee_v = (o.get("commissionNotionalTotalCollected") or {}).get("value")
         px = (o.get("price") or {}).get("value")
         price = None if px in (None, "") else (float(px) if c.ref["side"] == "long" else round(1 - float(px), 4))

@@ -44,13 +44,19 @@ def _leg_cost(fills: list[dict], venue: str, label: str) -> tuple[float, float]:
     return q_buy - q_sold, (cost / q_buy if q_buy else 0.0)
 
 
+def _cash_changed() -> None:
+    """A rescue fill moved cash on a venue: the next quote is sized from a fresh balance read, not the 20 s cache."""
+    from . import trader
+    trader._cash["dirty"] = True
+
+
 def check(db, cfg, brokers, games, log) -> int:
     """Try every open one-sided row whose contracts are in `games`. Returns how many were closed."""
     if not cfg.rescue:
         return 0
     mode = "live" if cfg.live else "dry"
-    rows = db.execute("SELECT * FROM trades WHERE mode=? AND status='open' AND outcome IN ('exposed','partial','error')",
-                      (mode,)).fetchall()
+    rows = db.execute("SELECT * FROM trades WHERE mode=? AND status='open' AND outcome IN "
+                      "('exposed','partial','error','dust')", (mode,)).fetchall()
     if not rows:
         return 0
     by_id = {c.id: c for g in games for c in g.contracts}
@@ -81,6 +87,8 @@ def check(db, cfg, brokers, games, log) -> int:
             bid = held.book.best_bid
             sell_lock = bid - held.fee.per_contract(bid) - cost
         hedge_ok = hedge_lock is not None and hedge_lock >= cfg.rescue_edge - 1e-9
+        if other.venue == "Kalshi" and residual < 1.0:
+            hedge_ok = False                # under one Kalshi contract: only a sell-back can close it
         sell_ok = sell_lock is not None and sell_lock >= cfg.rescue_sell - 1e-9
         if not hedge_ok and not sell_ok:
             continue
@@ -103,6 +111,7 @@ def _late_hedge(db, r, brokers, held, other, residual, cost, guaranteed, cfg, lo
         log(f"  · late hedge missed #{r['id']} {r['game']}: {other.label} {f.error or f.status} (limit {limit:.3f})")
         return 0
     fills.append(f.as_dict())
+    _cash_changed()
     qa, qb = (r["qty_a"], (r["qty_b"] or 0) + f.qty) if a_held else ((r["qty_a"] or 0) + f.qty, r["qty_b"])
     cash_out = (r["cash_out"] or 0.0) + f.qty * f.avg_price + f.fee
     hedged = min(qa, qb)
@@ -136,6 +145,7 @@ def _sell_back(db, r, brokers, held, residual, cost, cfg, log, fills, a_held, q_
         log(f"  · profit sell-back missed #{r['id']} {r['game']}: {held.label} {f.error or f.status} (min {min_price:.3f})")
         return 0
     fills.append(f.as_dict())
+    _cash_changed()
     qa, qb = ((r["qty_a"] or 0) - f.qty, r["qty_b"]) if a_held else (r["qty_a"], (r["qty_b"] or 0) - f.qty)
     cash_out = (r["cash_out"] or 0.0) - (f.qty * f.avg_price - f.fee)
     left = max(qa, qb) - min(qa, qb)

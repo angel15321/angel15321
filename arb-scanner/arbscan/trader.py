@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS trades (
   leg_a TEXT, leg_b TEXT,         -- contract snapshots (JSON)
   plan TEXT,                      -- planned qty / prices / ROI (JSON)
   fills TEXT,                     -- every order sent (JSON list)
-  outcome TEXT,                   -- hedged | partial | unwound | exposed | missed | error
+  outcome TEXT,                   -- hedged | partial | unwound | exposed | missed | error | dust | sold
   qty_a REAL, qty_b REAL,         -- contracts held after execution
   cash_out REAL,                  -- net cash spent (fees included, unwind proceeds netted)
   locked_profit REAL,             -- for fully hedged trades
@@ -157,8 +157,9 @@ def open_exposure(db, mode: str) -> float:
 
 
 def recent_failures(db, mode: str, n: int) -> int:
-    rows = db.execute("SELECT outcome, acked_at FROM trades WHERE mode=? AND outcome!='missed' ORDER BY id DESC LIMIT ?",
-                      (mode, n)).fetchall()
+    # 'dust' (a leg-1 fill under one Kalshi contract) is neither a failure nor a success: it is skipped like 'missed'
+    rows = db.execute("SELECT outcome, acked_at FROM trades WHERE mode=? AND outcome NOT IN ('missed','dust') "
+                      "ORDER BY id DESC LIMIT ?", (mode, n)).fetchall()
     streak = 0
     for r in rows:
         if r["outcome"] in ("unwound", "exposed", "partial", "error") and r["acked_at"] is None:
@@ -419,6 +420,12 @@ def _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, par
         # the fraction under one Kalshi contract can never be hedged there: dust, not a failed hedge
         outcome = "hedged"
         note += f"; {leftover:g} ct dust (under one Kalshi contract) held"
+    if q1 < 1.0 and c2.venue == "Kalshi" and hedged == 0 and outcome != "hedged":
+        # Leg 1 itself is under one Kalshi contract (someone sold a 0.01 lot into a resting quote): there was never
+        # anything to hedge, so it is not a failed hedge. 11-05 03:53Z: a 0.01 ct and a 0.06 ct fill (the second
+        # sold back at a profit) were booked 'exposed' / 'unwound' and halted the bot.
+        outcome = "dust"
+        note += f"; leg 1 is {q1:g} ct, under one Kalshi contract: dust, not a failed hedge"
 
     q_a, q_b = (qty1_held, hedged) if first == "a" else (hedged, qty1_held)
     return _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note=note, log=log, probe=probe)
@@ -429,7 +436,7 @@ def _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note="", lo
     cash_out = -sum(f.cash for f in fills)
     hedged = min(q_a, q_b)
     locked = (hedged * opp.guaranteed - cash_out) if outcome == "hedged" else None
-    status = "closed" if outcome in ("missed", "unwound") and max(q_a, q_b) < 0.01 else "open"
+    status = "closed" if outcome in ("missed", "unwound", "dust") and max(q_a, q_b) < 0.01 else "open"
     vals = dict(
         mode=mode, detected_at=detected, done_at=time.time(), game=opp.game.title,
         kickoff=opp.game.start.isoformat() if opp.game.start else None, opp_key=opp.key,
@@ -445,7 +452,7 @@ def _record(db, mode, opp, plan, detected, fills, outcome, q_a, q_b, note="", lo
     db.commit()
     vals["id"] = cur.lastrowid
     tag = {"hedged": "✔ HEDGED", "partial": "! PARTIAL", "exposed": "✖ EXPOSED", "unwound": "↺ UNWOUND",
-           "missed": "· MISSED", "error": "✖ ERROR"}[outcome]
+           "missed": "· MISSED", "error": "✖ ERROR", "dust": "· DUST"}[outcome]
     extra = f", locked +${locked:.2f}" if locked is not None else ""
     log(f"    {tag} {opp.game.title}: cash out ${cash_out:,.2f}{extra} — {note}")
     notify.trade(vals)          # Telegram, queued only: sent ~30 s later by its own thread (notify.py)

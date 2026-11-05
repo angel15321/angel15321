@@ -118,9 +118,10 @@ def trade_text(row: dict) -> str:
 
 
 def trade(row: dict) -> None:
-    """Queue a ledger row (trader._record): live rows that traded. A missed arb (nothing filled) is not a message."""
+    """Queue a ledger row (trader._record): live rows that traded. A missed arb (nothing filled) and a dust fill
+    (under one contract, cents) are not a message."""
     try:
-        if row.get("mode") != "live" or row.get("outcome") == "missed" or not enabled():
+        if row.get("mode") != "live" or row.get("outcome") in ("missed", "dust") or not enabled():
             return
         push(trade_text(row))
     except Exception:
