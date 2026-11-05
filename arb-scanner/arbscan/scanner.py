@@ -56,6 +56,15 @@ def snapshot(days: float = 8, poly_fee: float | None = None, kalshi_direct: bool
     for sp in winners.SPORTS:
         merged.update(results.get(f"Paired {sp}", {}))
     games = sorted(merged.values(), key=lambda g: (g.start or horizon, g.key))
+    # Polymarket answers its game lists with HTTP 200 and NO events during its maintenance (11-05 11:00-13:00Z, every
+    # league): no error, just a scan of Kalshi-only games and a bot with nothing to quote. Say so.
+    if games and not any(c.venue == "Polymarket" for g in games for c in g.contracts):
+        errors.append(f"Polymarket lists NO games ({len(games)} here are Kalshi-only): nothing to pair")
+    else:
+        quiet = [sp for sp in ("nfl", "nba", "nhl") if results.get(f"Kalshi {sp}") and f"Polymarket {sp}" in results
+                 and not results[f"Polymarket {sp}"] and not any(e.startswith(f"Polymarket {sp} ") for e in errors)]
+        if quiet:
+            errors.append(f"Polymarket lists no {', '.join(quiet)} games (Kalshi has them)")
     return Snapshot(games, errors, t0, (dt.datetime.now(dt.timezone.utc) - t0).total_seconds())
 
 

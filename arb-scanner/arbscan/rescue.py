@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import time
 
-from . import engine, notify
+from . import engine, hours, notify
 from .brokers import Fill, floor_to, max_price_within
 
 _next_try: dict[int, float] = {}       # trade id -> earliest next attempt (a miss waits RETRY_S)
@@ -90,6 +90,11 @@ def check(db, cfg, brokers, games, log) -> int:
         if other.venue == "Kalshi" and residual < 1.0:
             hedge_ok = False                # under one Kalshi contract: only a sell-back can close it
         sell_ok = sell_lock is not None and sell_lock >= cfg.rescue_sell - 1e-9
+        # a venue that is closed takes no order: 11-05 08:04Z nine late hedges in 10 s all came back "paused"
+        if hedge_ok and hours.closed(other.venue, other.ref.get("shard"), now, pad=False):
+            hedge_ok = False
+        if sell_ok and hours.closed(held.venue, held.ref.get("shard"), now, pad=False):
+            sell_ok = False
         if not hedge_ok and not sell_ok:
             continue
         _next_try[r["id"]] = now + RETRY_S
@@ -109,6 +114,7 @@ def _late_hedge(db, r, brokers, held, other, residual, cost, guaranteed, cfg, lo
     f = brokers[other.venue].buy(other, q, limit, notional_hint=q * limit)
     if not f.qty:
         log(f"  · late hedge missed #{r['id']} {r['game']}: {other.label} {f.error or f.status} (limit {limit:.3f})")
+        hours.refused(other, f.error)           # "paused": no more tries (and no quotes) until the venue trades
         return 0
     fills.append(f.as_dict())
     _cash_changed()
@@ -143,6 +149,7 @@ def _sell_back(db, r, brokers, held, residual, cost, cfg, log, fills, a_held, q_
     f = brokers[held.venue].sell(held, q, min_price)
     if not f.qty:
         log(f"  · profit sell-back missed #{r['id']} {r['game']}: {held.label} {f.error or f.status} (min {min_price:.3f})")
+        hours.refused(held, f.error)
         return 0
     fills.append(f.as_dict())
     _cash_changed()

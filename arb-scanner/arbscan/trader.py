@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import engine, kalshi, maker, notify, polymarket, rescue, scanner
+from . import engine, hours, kalshi, maker, notify, polymarket, rescue, scanner
 from .brokers import Fill, floor_to, max_price_within
 from .model import Contract
 
@@ -164,9 +164,12 @@ def open_exposure(db, mode: str) -> float:
 
 
 def recent_failures(db, mode: str, n: int) -> int:
-    # 'dust' (a leg-1 fill under one Kalshi contract) is neither a failure nor a success: it is skipped like 'missed'
+    # 'dust' (a leg-1 fill under one Kalshi contract) is neither a failure nor a success: it is skipped like 'missed'.
+    # So is a hedge the venue refused because it was PAUSED (hours.PAUSE_NOTE in the note): that says nothing about
+    # the bot, the quotes are already off (hours.py), and a halt there kept it down four hours on 11-05.
     rows = db.execute("SELECT outcome, acked_at FROM trades WHERE mode=? AND outcome NOT IN ('missed','dust') "
-                      "ORDER BY id DESC LIMIT ?", (mode, n)).fetchall()
+                      "AND (note IS NULL OR note NOT LIKE ?) ORDER BY id DESC LIMIT ?",
+                      (mode, f"%{hours.PAUSE_NOTE}%", n)).fetchall()
     streak = 0
     for r in rows:
         if r["outcome"] in ("unwound", "exposed", "partial", "error") and r["acked_at"] is None:
@@ -371,8 +374,10 @@ def _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, par
     hedged = f2.qty if f2 is not None else 0.0
     remaining = floor_to(q1 - hedged, step)
     hedge_books, gone = [], ""
+    # "trading is paused" is the venue's answer, not this order's: no retry can fill, and from now nothing rests
+    paused = f2 is not None and hours.refused(c2, f2.error)
     for attempt in range(cfg.hedge_attempts - (1 if parallel else 0)):
-        if remaining < min2:
+        if remaining < min2 or paused:
             break
         if attempt > 0:
             if "429" in (fills[-1].error or ""):
@@ -394,6 +399,7 @@ def _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, par
         remaining = floor_to(q1 - hedged, step)
         if remaining <= 0:
             break
+        paused = hours.refused(c2, f2.error)
     if hedge_books:
         probe["hedge_books"] = hedge_books
 
@@ -401,6 +407,8 @@ def _after_leg1(db, mode, opp, plan, detected, fills, c1, c2, f1, f2, first, par
     qty1_held = q1
     outcome = "hedged" if residual < 0.01 else ("partial" if hedged > 0 else "exposed")
     note = f"leg1 {q1:g} @ {f1.avg_price:.3f}; leg2 limit {limit2:.3f}, hedged {hedged:g}" + gone
+    if paused and residual >= 0.01:
+        note += f"; {c2.venue} answered 'trading is paused' to the hedge ({hours.PAUSE_NOTE})"
 
     if residual >= 0.01 and cfg.on_fail == "unwind":
         best_bid = c1.book.best_bid or 0
@@ -748,6 +756,8 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
     next_scan = 0.0
     maker_at = time.time()
     scan_said = ""                    # the scan-thread problem already logged
+    shut_said = ""                    # the venue closure already logged
+    hours_said = ""                   # the venue-hours read problem already logged
     watching = False                  # halted, staying up for held legs
     tm = state.setdefault("timing", _timing())
     busy_from = time.time()
@@ -775,6 +785,17 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
                 settle(db, log, min_gap=SETTLE_GAP, background=scan is not None)
             except Exception as e:
                 log(f"! settle error: {e}")
+            if cfg.maker:
+                shut = hours.text()
+                if shut != shut_said:            # said once per change; the quotes themselves come off in guard()
+                    log(f"‖ {shut}: no quote rests or is posted until it trades again" if shut
+                        else "▶ both venues trade again: quoting")
+                    shut_said = shut
+                bad = hours.problem()
+                if bad != hours_said:
+                    log(f"! {bad}: a Kalshi pause is seen only from its schedule, the book feed or a refused order"
+                        if bad else "  Kalshi exchange status readable again")
+                    hours_said = bad
             streak = recent_failures(db, mode, cfg.max_failures)
             if streak >= cfg.max_failures and not _halted:
                 # Halted = no new quote or arb until `arbscan ack` + a restart. Until 11-05 the process also EXITED
@@ -961,8 +982,10 @@ def _evaluate_sliced(db, cfg: Config, brokers: dict, games, moves, log, state: d
 
 def _status(games, what: str, scan_errors) -> str:
     feed = polymarket._feed
+    shut = hours.text()
     return (f"[{dt.datetime.now().strftime('%H:%M:%S')}] {len(games)} games · "
             f"{sum(len(g.contracts) for g in games):,} contracts · {what}"
+            + (f" · NOT QUOTING: {shut}" if shut else "")
             + (" · Polymarket feed DOWN" if feed is not None and not feed.alive() else "")
             + (" · " + "; ".join(scan_errors) if scan_errors else ""))
 

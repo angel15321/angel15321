@@ -97,6 +97,14 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
   re-priced on book changes at most every 0.5 s (`maker_event_gap`); a quoted game keeps 50 ms. Settlement
   and balance reads run on worker threads. The 60-s lines say where the time went (`pricing book changes N%,
   applying scans N%, order checks N%`) and how far apart the live quote checks were (median, 95th, longest).
+- **Venue hours (`hours.py`):** no quote rests, and none is posted, while either venue cannot trade. Kalshi's
+  closed hours are read from its public `GET /exchange/schedule` (Thursday 03:00-05:00 ET; built in as a
+  fallback) and its `GET /exchange/status` is read every 5 s on its own thread (`trading_active`, per exchange
+  index). Polymarket US closes Thursday 06:00-08:00 ET (documented; its game lists come back EMPTY then, and a
+  scan says `Polymarket lists NO games`). Quotes come off 120 s before a window and go back 60 s after it; the
+  status lines say `NOT QUOTING: <why>`. A hedge the venue refuses as "trading is paused" is not retried, is
+  not a failed-hedge strike (no halt: on 11-05 two of them kept the bot down four hours), and closes that
+  venue here for 60 s, doubling on each repeat. The held-leg watcher sends no order to a closed venue.
 - **Scope:** games starting within `--maker-horizon-h` (24 h). `--maker-in-play nhl,tennis,nba,nfl` (no value =
   every `--sports`) also quotes games in progress of those sports, with a bigger required edge
   (`--maker-live-edge-c`, 4¢ a pair), at most `--maker-live-quotes` (2) of the slots, and a pull on ANY Kalshi

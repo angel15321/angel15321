@@ -15,7 +15,7 @@ import json
 import signal
 import sys
 
-from . import engine, fees, kalshi, kalshiws, notify, pmws, polymarket, report, scanner, trader
+from . import engine, fees, hours, kalshi, kalshiws, notify, pmws, polymarket, report, scanner, trader
 
 
 def _log_to(path: str | None):
@@ -108,6 +108,8 @@ def cmd_run(a):
         polymarket._orders = of
         log("Polymarket order updates: private websocket (REST poll every 1 s as backup)" if of is not None
             else "Polymarket order updates: REST poll every 1 s")
+        hours.start()               # venue hours: its own thread reads Kalshi's exchange status and schedule
+        log(hours.describe())
     # systemd stops the bot with SIGTERM: turn it into the Ctrl-C path so a resting quote is cancelled on the way out
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     log(f"Stop: Ctrl-C, or create a file named '{cfg.kill_file}' here. Ledger: {a.db}")

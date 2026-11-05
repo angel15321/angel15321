@@ -36,7 +36,7 @@ import math
 import time
 from dataclasses import dataclass, field
 
-from . import engine, kalshi, polymarket
+from . import engine, hours, kalshi, polymarket
 from .brokers import Fill, floor_to, max_price_within
 from .model import Contract
 
@@ -109,6 +109,7 @@ class State:
     last_post: float = 0.0
     rejects: int = 0
     paused: str = ""
+    closed: str = ""          # why nothing may be posted right now: a venue is closed (hours.py); "" = both trade
     modify_ok: bool = True    # False after a modify that did not take: re-price by cancel + post this run
     modify_checks: int = 0
     modify_slow: int = 0      # slow modifies in a row (accepted, not applied within MODIFY_WAIT)
@@ -269,6 +270,14 @@ def _k_pot(k: Contract, shards, k_all: float) -> float:
     return k_all
 
 
+def _hedge_closed(k: Contract, now: float, memo: dict) -> str:
+    """Why Kalshi cannot take the hedge of a quote on `k` right now ("" = it can), per exchange shard."""
+    sh = k.ref.get("shard")
+    if sh not in memo:
+        memo[sh] = hours.closed("Kalshi", sh, now)
+    return memo[sh]
+
+
 def _feeds_ok() -> bool:
     pf, kf = polymarket._feed, kalshi._feed
     return pf is not None and pf.alive() and kf is not None and kf.alive()
@@ -303,6 +312,11 @@ def step(db, cfg, brokers, games, log, full: bool = False):
                 return "halt"
     if s.paused:
         return None
+    # A venue closed for maintenance or paused (hours.py): nothing is posted. 11-05 08:04Z two quotes filled on
+    # Polymarket while Kalshi answered every hedge with 409 trading_is_paused.
+    s.closed = hours.quoting(None, now)
+    if s.closed:
+        return None
     ok = [g for g in games if _pregame(g, now_dt) or live_ok(cfg, g)]
     if not ok or not _feeds_ok():
         return None
@@ -315,8 +329,10 @@ def step(db, cfg, brokers, games, log, full: bool = False):
         return None
     own = {q.pm_id: q for q in s.quotes.values()}
     taken = trader.recent_keys(db, cfg.cooldown_min)        # one read, not one per candidate
+    shut: dict = {}                                          # Kalshi exchange shard -> why it is closed
     cands = [c for c in candidates(cfg, ok, per, own)
-             if now - c.k.book.fetched_at <= cfg.max_book_age and c.key not in taken]
+             if now - c.k.book.fetched_at <= cfg.max_book_age and c.key not in taken
+             and not _hedge_closed(c.k, now, shut)]
     if full:
         s.stats["quotable"] = max(s.stats["quotable"], len(cands))
         s.quotable = {}
@@ -441,6 +457,9 @@ def sync(db, cfg, brokers, games, log):
 
 
 def _unsafe(cfg, q: Quote, seen: bool, now: float, now_dt) -> str:
+    why = hours.quoting(q.k.ref.get("shard") if q.k is not None else None, now)
+    if why:
+        return why                               # the hedge venue (or Polymarket) is closed: nothing rests
     if not _feeds_ok():
         return "a book feed is down"
     if not seen:
@@ -941,6 +960,7 @@ def stats_text() -> str:
            f"resting {len(STATE.quotes)}" + (f": {rest}" if rest else "")
            + _gap_text()
            + (" · modify OFF (cancel + post)" if not STATE.modify_ok else "")
+           + (f" · NOT QUOTING: {hours.text()}" if hours.text() else "")
            + (f" · PAUSED: {STATE.paused}" if STATE.paused else ""))
     STATE.stats = {k: 0 for k in s}
     STATE.guard_gap, STATE.gaps = 0.0, []
