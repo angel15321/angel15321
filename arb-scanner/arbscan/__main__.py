@@ -185,7 +185,7 @@ def cmd_fees(a):
         print(f"{pr * 100:5.0f}¢ {kf:11.2f} {kp * 100:5.2f}% {pf:9.2f} {pp * 100:5.2f}% {be:14.2f}¢")
 
 
-SPORTS = ("nfl", "nba", "nhl", "tennis")
+SPORTS = ("nfl", "nba", "nhl", "tennis", "soccer", "cfb", "cbb", "ufc")
 
 
 def _sports(text: str) -> tuple[str, ...]:
@@ -278,7 +278,7 @@ def main(argv=None):
     r.add_argument("--kalshi-demo", action="store_true", help="send Kalshi orders to the demo exchange")
     r.add_argument("--once", action="store_true", help="single scan then exit")
     r.add_argument("--sports", type=_sports, default=("nfl",),
-                   help="comma list: nfl (moneylines + spreads), nba (moneylines + spreads + totals), nhl (moneylines), tennis (ATP/WTA/Challenger match winners); default nfl")
+                   help="comma list: nfl (moneylines + spreads), nba (moneylines + spreads + totals), nhl (moneylines), tennis (ATP/WTA/Challenger match winners), soccer (EPL/MLS/La Liga/Bundesliga/UCL winners), cfb / cbb (college football / basketball winners), ufc (fight winners); default nfl")
     r.set_defaults(fn=cmd_run)
 
     c = sub.add_parser("check", help="verify API keys and show balances")

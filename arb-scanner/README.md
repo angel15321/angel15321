@@ -77,6 +77,11 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
   (`--maker-live-edge-c`, 4¢ a pair), at most `--maker-live-quotes` (2) of the slots, and a pull on ANY Kalshi
   tick against the hedge (in play a tick is news). A pre-game quote never carries into play: it is pulled at
   the start. Riskier: news moves Kalshi before a Polymarket cancel lands. The taker path is off while it runs.
+- **Soccer, college football / basketball, UFC** (`--sports soccer,cfb,cbb,ufc`, `winners.py`): winner markets
+  paired by NAME -- the game's date (or the day before: Kalshi uses the US day) and BOTH sides' names must map
+  one-to-one onto exactly one Kalshi event, and a pair whose two venues price the same side more than 15¢ apart
+  is dropped. "X wins" + "X does not win" (or both "does not win" sides) cover every result, a draw included;
+  the soccer draw market itself is not used.
 - **NHL** (`--sports nhl`): moneylines only. A shootout adds a goal to the final score and whether each
   venue's puck line / total counts it is not checked, so those are not paired.
 

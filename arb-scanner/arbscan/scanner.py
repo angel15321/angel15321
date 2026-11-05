@@ -5,7 +5,7 @@ import concurrent.futures as cf
 import datetime as dt
 from dataclasses import dataclass, field
 
-from . import kalshi, polymarket, tennis
+from . import kalshi, polymarket, tennis, winners
 from .model import Contract, Game
 
 
@@ -30,6 +30,9 @@ def snapshot(days: float = 8, poly_fee: float | None = None, kalshi_direct: bool
             jobs[f"Kalshi {sp}"] = lambda sp=sp: kalshi.fetch(horizon, kalshi_direct, sp)
     if "tennis" in sports:
         jobs["Tennis"] = lambda: tennis.fetch(horizon, poly_fee, kalshi_direct)   # both venues, already paired
+    for sp in winners.SPORTS:
+        if sp in sports:                                                          # paired by name, like tennis
+            jobs[f"Paired {sp}"] = lambda sp=sp: winners.fetch(horizon, sp, poly_fee, kalshi_direct)
     with cf.ThreadPoolExecutor(max_workers=len(jobs) or 1) as ex:
         futs = {ex.submit(fn): name for name, fn in jobs.items()}
         for f in cf.as_completed(futs):
@@ -50,6 +53,8 @@ def snapshot(days: float = 8, poly_fee: float | None = None, kalshi_direct: bool
             m.links.update(g.links)
             m.contracts += g.contracts
     merged.update(results.get("Tennis", {}))
+    for sp in winners.SPORTS:
+        merged.update(results.get(f"Paired {sp}", {}))
     games = sorted(merged.values(), key=lambda g: (g.start or horizon, g.key))
     return Snapshot(games, errors, t0, (dt.datetime.now(dt.timezone.utc) - t0).total_seconds())
 
