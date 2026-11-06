@@ -101,6 +101,13 @@ and lets the fill come to it, then hedges on Kalshi, the fast venue.
   how long a book change waited before the resting quotes were checked against it. The gap between two checks
   is long whenever no book moves (the loop sleeps until a book changes or an order read is due), so it only
   bounds that latency from above. The cancel's own round trip to Polymarket comes on top of both.
+- **Polymarket cancels and order reads on worker threads:** in the trading loop a pull hands its cancel to a
+  worker and goes straight on to the next quote; order reads (the 3-s safety net, the look at a quote whose
+  cancel is out) go the same way. The trading thread only applies the replies -- a fill is hedged and booked
+  there, exactly once. One slow reply (11-05: a 7.4 s cancel, order reads of 1-5 s) no longer stops the other
+  quotes from being checked. A quote's first cancel is always sent; reads and repeated cancels wait when the
+  workers are busy. Posts, modifies, the cancel inside the fill path and the way out stay on the trading thread.
+  The 60-s line says `(cancels and reads on worker threads, the slowest N ms; posts on this thread)`.
 - **Venue hours (`hours.py`):** no quote rests, and none is posted, while either venue cannot trade. Kalshi's
   closed hours are read from its public `GET /exchange/schedule` (Thursday 03:00-05:00 ET; built in as a
   fallback) and its `GET /exchange/status` is read every 5 s on its own thread (`trading_active`, per exchange

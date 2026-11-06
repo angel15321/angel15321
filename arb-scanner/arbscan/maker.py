@@ -30,9 +30,11 @@ and a fill whose hedge fails goes through the same hold / halt rules as a taker 
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import datetime as dt
 import json
 import math
+import queue
 import time
 from dataclasses import dataclass, field
 
@@ -59,6 +61,9 @@ STOP_TRIES = 4           # cancel passes on the way out (each waits up to 1.5 s 
 DEAD_POLL = 0.3          # s between looks at a quote whose cancel is out but not confirmed yet
 STREAM_POLL = 3.0        # s between REST reads of a quote the private order stream is following (a safety net only;
                          # 11-05: one read a second per quote was three round trips a second on the trading thread)
+WAKE_KEY = "\x00maker"   # what a worker marks on the trading loop's Trigger when a cancel / read reply is ready
+CALL_WORKERS = 6         # threads for Polymarket cancels and order reads (one slow reply holds one of them, not the loop)
+CALL_STALE = 2.0         # s after which a cancel / read that has not come back may be sent again
 SUSPECT_S = 30.0         # s a quote whose post came back as an ERROR is looked for on Polymarket (the exchange
                          # processes or rejects an order within 5 s of receiving it; our HTTP timeout is 15 s)
 
@@ -93,6 +98,8 @@ class Quote:
                                  # is confirmed (or sent again) by poll(), and any fill meanwhile is hedged and booked
     why: str = ""                # why it was pulled (the ledger note once the cancel is confirmed)
     cancel_at: float = 0.0       # when its cancel was last sent
+    cancel_out: float = 0.0      # a cancel for it is out on a worker thread since then (0 = none)
+    read_out: float = 0.0        # ... an order read
 
     def unbooked(self, st: dict) -> float:
         """Contracts the order state `st` shows filled that no trade row holds yet."""
@@ -120,7 +127,12 @@ class State:
     gaps: list = field(default_factory=list)       # every such gap since the last 60-s line (median / 95th for the log)
     changed_at: float = 0.0   # when the oldest book change not yet checked against the quotes arrived (0 = none)
     lags: list = field(default_factory=list)       # book change -> live quote check, s: the pull latency itself
-    net: dict = field(default_factory=lambda: {"cancel": 0.0, "post": 0.0, "read": 0.0})   # s in Polymarket calls
+    net: dict = field(default_factory=lambda: {"cancel": 0.0, "post": 0.0, "read": 0.0, "slow": 0.0})   # s in
+    #                           Polymarket calls ("slow" = the longest single cancel / read)
+    pool: object = None       # worker threads for Polymarket cancels and order reads (start_calls); None = the caller's
+    results: object = None    # their replies, applied by the trading thread in poll()
+    wake: object = None       # called by a worker when a reply is ready
+    calls_out: int = 0        # cancels / reads handed to the workers whose reply has not been applied yet
     suspects: list = field(default_factory=list)   # posts that came back as an error: may rest all the same
     sweep_at: float = 0.0
     stats: dict = field(default_factory=lambda: {"quotable": 0, "posted": 0, "pulled": 0, "repriced": 0,
@@ -137,7 +149,116 @@ STATE = State()
 
 def reset() -> None:
     global STATE
+    stop_calls()
     STATE = State()
+
+
+def start_calls(wake=None) -> None:
+    """From now on pull() and poll() hand their Polymarket cancels and order reads to worker threads and the
+    trading thread only applies the replies (poll -> _drain). 11-05: the trading thread's longest block was over 1 s
+    in 74 of 645 minutes, each on ONE slow call -- a 7.4 s cancel, 2-5 s of order reads -- and while it was out no
+    other quote was checked; miss #70 sat ~75 ms behind an order read. The trading loop calls this; anything that
+    calls maker directly (tests, the way out) keeps the calls on its own thread. `wake` is called from the worker."""
+    s = STATE
+    if s.pool is None:
+        s.pool = cf.ThreadPoolExecutor(max_workers=CALL_WORKERS, thread_name_prefix="pm-call")
+        s.results = queue.SimpleQueue()
+        s.calls_out = 0
+    s.wake = wake
+
+
+def stop_calls() -> None:
+    s = STATE
+    pool, s.pool, s.wake = s.pool, None, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _send(kind: str, brokers, q: Quote, first: bool = False) -> bool:
+    """Hand a "cancel" or a "read" of `q`'s order to a worker. False when one of that kind is still out, or -- for
+    a read or a REPEATED cancel -- when the workers are busy: with Polymarket stalling (15 s a call) repeats would
+    pile up in front of the one call that matters, the first cancel of a quote being pulled (first=True: always sent,
+    and reads leave two workers free for it)."""
+    s = STATE
+    now = time.time()
+    out = q.cancel_out if kind == "cancel" else q.read_out
+    if out and now - out < CALL_STALE:
+        return False
+    if not first and s.calls_out >= (CALL_WORKERS if kind == "cancel" else CALL_WORKERS - 2):
+        return False
+    if kind == "cancel":
+        q.cancel_out = now
+    else:
+        q.read_out = now
+    try:
+        s.pool.submit(_call, kind, brokers["Polymarket"], q.pm, q.oid, s.results, s.wake)
+    except RuntimeError:                         # the pool is shutting down
+        return False
+    s.calls_out += 1
+    return True
+
+
+def _call(kind: str, broker, pm: Contract, oid: str, results, wake) -> None:
+    """On a worker thread: one cancel (+ its single read) or one order read. Touches no maker state."""
+    t0 = time.time()
+    try:
+        st = (broker.cancel(pm, oid, wait=0.0) if kind == "cancel" else broker.order_state(pm, oid)) or {}
+    except Exception as e:
+        st = {"error": f"{type(e).__name__}: {e}"}
+    results.put((kind, oid, st, t0, time.time()))
+    if wake is not None:
+        try:
+            wake()
+        except Exception:
+            pass
+
+
+def _drain(db, cfg, brokers, log):
+    """Apply the worker replies that have come back (trading thread only)."""
+    s = STATE
+    if s.results is None:
+        return None
+    while True:
+        try:
+            kind, oid, st, t0, t1 = s.results.get_nowait()
+        except queue.Empty:
+            return None
+        s.calls_out = max(0, s.calls_out - 1)
+        s.net[kind] += t1 - t0
+        s.net["slow"] = max(s.net["slow"], t1 - t0)
+        q = s.quotes.get(oid)
+        if q is None:
+            continue                             # closed meanwhile (the order stream was faster)
+        if kind == "cancel":
+            q.cancel_out = 0.0
+        else:
+            q.read_out = 0.0
+        if _apply(db, cfg, brokers, q, st, log, kind) == "halt":
+            return "halt"
+
+
+def _apply(db, cfg, brokers, q: Quote, st: dict, log, kind: str):
+    """What an order state means for a quote: a fill is hedged and booked, a finished order is closed."""
+    if q.dead:
+        if q.unbooked(st) > 1e-9:
+            return _filled(db, cfg, brokers, q, st, log, cancelled=True)
+        if _confirmed(st):
+            _drop(db, q, (f"pulled: {q.why}" if q.why else "its cancel was confirmed late")
+                  + (f"; {q.booked:g} had filled" if q.booked else ""))
+            if q.booked:
+                log(f"  ✕ quote {q.title} {q.oid}: cancel confirmed, {q.booked:g} had filled")
+        elif kind == "cancel" and st.get("error"):
+            log(f"  ! quote cancel not confirmed ({q.title} {q.oid}): {st['error']}; retrying")
+        return None
+    if st.get("error"):
+        log(f"! maker: order read failed: {st['error']}")
+        return None
+    if q.unbooked(st) > 1e-9:
+        return _filled(db, cfg, brokers, q, st, log)
+    if st.get("done"):                           # cancelled / expired by the exchange without a (new) fill
+        _drop(db, q, f"closed by the exchange: {st.get('state')}")
+        log(f"  ✕ quote {q.title} closed by the exchange ({st.get('state')})")
+    return None
 
 
 # ---------------------------------------------------------------- pricing
@@ -699,6 +820,18 @@ def pull(db, cfg, brokers, q: Quote, why: str, log, wait: float | None = 0.0):
     s = STATE
     if q.oid not in s.quotes:
         return None
+    if s.pool is not None and wait is not None:
+        # The cancel leaves on a worker thread; this thread goes straight on to the next quote. The quote is dead
+        # from here (slot held, never re-priced); the reply -- cancelled, or what it filled -- is applied by poll().
+        if not q.dead:
+            q.dead, q.why = True, q.why or why
+            s.stats["pulled"] += 1
+            log(f"  ✕ pulled {q.title} {q.pm.label} @ {q.price:.2f}: {why}")
+        first = not q.cancel_at
+        q.polled_at = time.time()
+        if _send("cancel", brokers, q, first=first):
+            q.cancel_at = q.polled_at
+        return None
     q.cancel_at = time.time()
     st = _cancel(brokers, q.pm, q.oid, wait=wait)
     if q.unbooked(st) > 1e-9:
@@ -746,8 +879,11 @@ def poll(db, cfg, brokers, log, force: bool = False):
     s = STATE
     now = time.time()
     feed = polymarket._orders
+    if _drain(db, cfg, brokers, log) == "halt":                  # replies of the cancels / reads sent to workers
+        return "halt"
     if s.suspects and _sweep(db, cfg, brokers, log, now) == "halt":
         return "halt"
+    away = s.pool is not None and not force                      # the calls go to workers; force = here and now
     for q in list(s.quotes.values()):
         st = feed.state(q.oid, q.pm) if feed is not None else None
         if q.dead:
@@ -755,34 +891,31 @@ def poll(db, cfg, brokers, log, force: bool = False):
                 if not force and now - q.polled_at < DEAD_POLL:
                     continue
                 q.polled_at = now
-                if force or now - q.cancel_at >= cfg.maker_poll:
+                again = force or now - q.cancel_at >= cfg.maker_poll      # not showing after a second: send it again
+                if away:
+                    if not again:
+                        _send("read", brokers, q)
+                    elif _send("cancel", brokers, q):
+                        q.cancel_at = now
+                    continue
+                if again:
                     q.cancel_at = now
-                    st = _cancel(brokers, q.pm, q.oid, wait=0.0)      # not showing after a second: send it again
+                    st = _cancel(brokers, q.pm, q.oid, wait=0.0)
                 else:
                     st = _read(brokers, q)
-            if q.unbooked(st) > 1e-9:
-                if _filled(db, cfg, brokers, q, st, log, cancelled=True) == "halt":
-                    return "halt"
-            elif _confirmed(st):
-                _drop(db, q, (f"pulled: {q.why}" if q.why else "its cancel was confirmed late")
-                      + (f"; {q.booked:g} had filled" if q.booked else ""))
-                if q.booked:
-                    log(f"  ✕ quote {q.title} {q.oid}: cancel confirmed, {q.booked:g} had filled")
+            if _apply(db, cfg, brokers, q, st, log, "read") == "halt":
+                return "halt"
             continue
         if (st is None or q.unbooked(st) <= 1e-9) and (force or now - q.polled_at >= _poll_every(cfg, q, st, feed)):
             q.polled_at = now
-            st = _read(brokers, q)
-            if st.get("error"):
-                log(f"! maker: order read failed: {st['error']}")
-                continue
+            if away:
+                _send("read", brokers, q)                        # the stream's word (if any) is still used below
+            else:
+                st = _read(brokers, q)
         if not st:
             continue
-        if q.unbooked(st) > 1e-9:
-            if _filled(db, cfg, brokers, q, st, log) == "halt":
-                return "halt"
-        elif st.get("done"):                    # cancelled / expired by the exchange without a (new) fill
-            _drop(db, q, f"closed by the exchange: {st.get('state')}")
-            log(f"  ✕ quote {q.title} closed by the exchange ({st.get('state')})")
+        if _apply(db, cfg, brokers, q, st, log, "read") == "halt":
+            return "halt"
     return None
 
 
@@ -1006,6 +1139,8 @@ def _gap_text() -> str:
     waited = (f" · book change -> quote check: {lag[len(lag) // 2] * 1000:.1f} ms (median), "
               f"{lag[int(len(lag) * 0.95)] * 1000:.1f} ms (95th), {lag[-1] * 1000:.0f} ms worst, {len(lag):,} changes"
               if lag else "")
+    where = (f" (cancels and reads on worker threads, the slowest {n['slow'] * 1000:.0f} ms; posts on this thread)"
+             if STATE.pool is not None else "")
     return (waited + f" · quotes checked live every {g[len(g) // 2] * 1000:.0f} ms (median), "
             f"{g[int(len(g) * 0.95)] * 1000:.0f} ms (95th), at most {g[-1] * 1000:.0f} ms apart · Polymarket calls: "
-            f"cancels {n['cancel']:.1f}s, posts {n['post']:.1f}s, order reads {n['read']:.1f}s")
+            f"cancels {n['cancel']:.1f}s, posts {n['post']:.1f}s, order reads {n['read']:.1f}s" + where)

@@ -769,11 +769,15 @@ def _loop(db, cfg: Config, brokers: dict, days: float, interval: float, once: bo
         scan.start()
         log("Full scans run on their own thread; the trading thread applies each finished one (--scan-inline = as before)")
     _cash["bg"] = scan is not None    # balance re-reads off the trading thread (maker._room)
+    if scan is not None and cfg.maker:
+        maker.start_calls(wake=lambda: trig.mark(maker.WAKE_KEY))     # Polymarket cancels / order reads on workers
+        log("Polymarket cancels and order reads run on worker threads; the trading thread applies their replies")
     try:
         return _loop_on(db, cfg, brokers, days, interval, once, log, state, trig, mode, scan)
     finally:
         _halted = ""                  # the flag belongs to this run of the loop
         _cash["bg"] = False
+        maker.stop_calls()            # the way out (maker.shutdown) cancels on this thread and waits
         if scan is not None:
             scan.stop()
 
@@ -926,7 +930,7 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
         busy_from = lap_at[0] = time.time()
         try:
             keys = trig.take()
-            if cfg.maker and trig.taken_since and keys != {SCAN_KEY}:
+            if cfg.maker and trig.taken_since and keys - {SCAN_KEY, maker.WAKE_KEY}:
                 maker.STATE.changed_at = trig.taken_since     # the next live quote check logs how long it waited
             if _on_events(db, cfg, brokers, state, keys, log) == "halt":
                 next_scan = 0.0                          # the halt check at the top of the loop reports it
