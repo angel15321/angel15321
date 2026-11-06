@@ -74,8 +74,8 @@ def connect(path: str) -> sqlite3.Connection:
 def ack_failures(db, mode: str = "live") -> int:
     """Mark every unacknowledged failed trade as reviewed, so the halt streak restarts from zero.
     The positions themselves are untouched (held ones still settle and book their P&L)."""
-    n = db.execute("UPDATE trades SET acked_at=? WHERE mode=? AND acked_at IS NULL AND outcome IN "
-                   "('unwound','exposed','partial','error')", (time.time(), mode)).rowcount
+    n = db.execute("UPDATE trades SET acked_at=? WHERE mode=? AND acked_at IS NULL AND (outcome IN "
+                   "('unwound','exposed','partial','error') OR pnl < 0)", (time.time(), mode)).rowcount
     db.commit()
     return n
 
@@ -100,6 +100,8 @@ class Config:
     leg1: str = "auto"                # auto (stale venue first in-play) | polymarket | kalshi
     cross_venue_only: bool = False
     max_failures: int = 2             # halt after this many unhedged/unwound trades in a row
+    kill_trade_loss: float = 0.0      # $: halt when one trade realizes a loss above this (0 = off); operator 11-06: 15
+    kill_day_loss: float = 0.0        # $: halt when this UTC day's realized P&L is below -this (0 = off); 11-06: 25
     kill_file: str = "STOP"
     sports: tuple[str, ...] = ("nfl",)  # nfl | nba | tennis
     legs: str = "sequential"          # sequential (stale leg first, then hedge) | parallel (both at once; a vanished
@@ -177,6 +179,27 @@ def recent_failures(db, mode: str, n: int) -> int:
         else:
             break
     return streak
+
+
+def loss_kill(db, mode: str, cfg: "Config") -> str | None:
+    """Operator kill rules (11-06, with $100 quotes / $500 a day): halt when ONE trade realized a loss above
+    cfg.kill_trade_loss, or when this UTC day's realized P&L is below -cfg.kill_day_loss. Realized = rows settled or
+    closed; a closed row (sold back, unwound) has no settled_at, so its day is when it was done. Only rows not yet
+    acknowledged count, so `arbscan ack` + a restart is the deliberate way back (same as the failed-hedge halt)."""
+    if cfg.kill_trade_loss > 0:
+        r = db.execute("SELECT id, game, pnl FROM trades WHERE mode=? AND status IN ('settled','closed') "
+                       "AND acked_at IS NULL AND pnl < ? ORDER BY pnl LIMIT 1",
+                       (mode, -cfg.kill_trade_loss)).fetchone()
+        if r is not None:
+            return f"trade #{r['id']} {r['game']} lost ${-r['pnl']:,.2f} (kill at ${cfg.kill_trade_loss:,.0f})"
+    if cfg.kill_day_loss > 0:
+        r = db.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE mode=? AND status IN ('settled','closed') "
+                       "AND acked_at IS NULL AND pnl IS NOT NULL AND COALESCE(settled_at, done_at, detected_at)>=?",
+                       (mode, _today_start())).fetchone()
+        day = float(r[0])
+        if day < -cfg.kill_day_loss:
+            return f"today's realized P&L is ${day:,.2f} (kill below -${cfg.kill_day_loss:,.0f})"
+    return None
 
 
 def mid(c: Contract) -> float | None:
@@ -815,6 +838,16 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
                                 + (f"; still watching {n} held leg(s) for a profitable exit, then it stops" if n
                                    else "; the bot is DOWN")
                                 + ". It stays halted until `arbscan ack` + a restart.", urgent=True)
+            why = loss_kill(db, mode, cfg) if not _halted else None
+            if why:
+                _halted = why
+                n = held_legs(db, mode) if cfg.rescue and not once else 0
+                log(f"Halting: loss kill -- {why}. Review the log, then `arbscan ack` and run again."
+                    + (f" No new quotes or arbs; still watching {n} held leg(s) for a profitable exit." if n else ""))
+                if mode == "live":
+                    notify.push(f"🔴 HALTED (loss kill): {why}. No new quotes"
+                                + (f"; still watching {n} held leg(s), then it stops" if n else "; the bot is DOWN")
+                                + ". Roll back the size or `arbscan ack` + a restart.", urgent=True)
             if _halted:
                 if cfg.maker and maker.STATE.quotes:
                     maker.shutdown(db, cfg, brokers, log)             # nothing rests while halted (repeats until gone)

@@ -57,7 +57,8 @@ def cmd_run(a):
         min_roi=a.min_roi, min_profit=a.min_profit, slippage=a.slippage, hedge_attempts=a.hedge_attempts,
         on_fail=a.on_fail, unwind_max_loss=a.unwind_max_loss, cooldown_min=a.cooldown, include_live_games=a.include_live_games or a.in_play_only,
         in_play_only=a.in_play_only, leg1=a.leg1,
-        cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file, sports=a.sports,
+        cross_venue_only=a.cross_venue_only, max_failures=a.max_failures, kill_file=a.kill_file,
+        kill_trade_loss=a.kill_trade_loss, kill_day_loss=a.kill_day_loss, sports=a.sports,
         legs=a.legs, max_book_age=a.max_book_age, trigger=a.trigger, event_gap=a.event_gap_ms / 1000,
         confirm_s=a.confirm_ms / 1000, stale_pm=a.stale_pm, hedge_max_loss=a.hedge_max_loss,
         maker=a.maker, maker_edge=a.maker_edge_c / 100, maker_ttl=a.maker_ttl,
@@ -82,6 +83,8 @@ def cmd_run(a):
     else:
         log("DRY RUN — fills are simulated against live order books; nothing is sent. Add --live to trade.")
     log(f"Limits: ${cfg.max_per_trade:,.0f}/arb · ${cfg.max_daily_spend:,.0f}/day · ${cfg.max_open:,.0f} open · "
+        f"{f'loss kill ${cfg.kill_trade_loss:,.0f}/trade · ' if cfg.kill_trade_loss else ''}"
+        f"{f'loss kill ${cfg.kill_day_loss:,.0f}/day · ' if cfg.kill_day_loss else ''}"
         f"min ROI {cfg.min_roi * 100:.2f}% · min profit ${cfg.min_profit:.2f} · on failed hedge: {cfg.on_fail}"
         f"{f' (loss <= fees + ${cfg.unwind_max_loss:.2f}/ct, else hold)' if cfg.on_fail == 'unwind' else ''} · "
         f"{'in-play only' if cfg.in_play_only else 'pre-game + live games' if cfg.include_live_games else 'pre-game only'}"
@@ -156,7 +159,7 @@ def cmd_status(a):
 def cmd_ack(a):
     db = trader.connect(a.db)
     n = trader.ack_failures(db, "dry" if a.dry else "live")
-    print(f"acknowledged {n} failed trade(s); the halt streak starts again from zero. "
+    print(f"acknowledged {n} failed or losing trade(s); the halt streak and the loss kill start again from zero. "
           "Held positions are unchanged and still settle.")
 
 
@@ -279,6 +282,10 @@ def main(argv=None):
     r.add_argument("--cross-venue-only", action="store_true")
     r.add_argument("--cooldown", type=float, default=10, help="minutes before re-taking the same pair")
     r.add_argument("--max-failures", type=int, default=2, help="halt after N failed hedges in a row")
+    r.add_argument("--kill-trade-loss", type=float, default=0.0,
+                   help="halt when one trade realizes a loss above this many $ (default 0 = off)")
+    r.add_argument("--kill-day-loss", type=float, default=0.0,
+                   help="halt when the UTC day's realized P&L falls below -this many $ (default 0 = off)")
     r.add_argument("--interval", type=float, default=15, help="seconds between scans (default 15)")
     r.add_argument("--days", type=float, default=8)
     r.add_argument("--db", default="trades.db")
