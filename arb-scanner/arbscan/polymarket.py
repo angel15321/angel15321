@@ -73,7 +73,10 @@ def _event_markets(slug: str, kinds: dict = KINDS) -> list[dict]:
         return hit[1]
     ms = (http.get(f"{GATEWAY}/v1/events/slug/{slug}").get("event") or {}).get("markets") or []
     ms = [m for m in ms if m.get("sportsMarketType") in kinds]
-    _events[slug] = (time.time(), ms)
+    now = time.time()
+    for s in [s for s, (at, _) in list(_events.items()) if now - at >= EVENT_TTL]:   # finished games never come back
+        _events.pop(s, None)
+    _events[slug] = (now, ms)
     return ms
 
 

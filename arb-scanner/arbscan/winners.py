@@ -39,6 +39,7 @@ SPORTS = {   # sport -> ({Polymarket league: Kalshi winner series}, Polymarket w
     "cbb": ({"cbb": "KXNCAAMBGAME"}, {"basketball_team_full_game_winner"}),
     "ufc": ({"ufc": "KXUFCFIGHT"}, {"ufc_fight_winner"}),
 }
+WIN_TYPES = frozenset(t for _, types in SPORTS.values() for t in types)   # every sport's winner market types
 MON = "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split()
 PAIR_TTL = 60            # s to reuse a sport's pairing (books are re-read every scan)
 EVENT_TTL = 6 * 3600     # s to cache each event's market list
@@ -80,11 +81,18 @@ def _pm_events(league: str) -> list[dict]:
 
 
 def _pm_event(slug: str) -> dict:
+    """The event's WINNER markets only (all a pairing reads), cached EVENT_TTL. A full event carries every spread /
+    total / prop (~0.8 MB parsed) and the cache never dropped a slug: 11-06 the box bot was OOM-killed at its 400 MB
+    limit with ~70 MB of finished games' events held here. Now only winner markets are kept and stale slugs go."""
+    now = time.time()
     hit = _events.get(slug)
-    if hit and time.time() - hit[0] < EVENT_TTL:
+    if hit and now - hit[0] < EVENT_TTL:
         return hit[1]
     ev = http.get(f"{polymarket.GATEWAY}/v1/events/slug/{slug}").get("event") or {}
-    _events[slug] = (time.time(), ev)
+    ev = {"markets": [m for m in ev.get("markets") or [] if m.get("sportsMarketType") in WIN_TYPES]}
+    for s in [s for s, (at, _) in list(_events.items()) if now - at >= EVENT_TTL]:
+        _events.pop(s, None)
+    _events[slug] = (now, ev)
     return ev
 
 

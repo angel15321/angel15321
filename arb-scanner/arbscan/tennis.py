@@ -62,11 +62,17 @@ def _pm_events(league: str) -> list[dict]:
 
 
 def _pm_event(slug: str) -> dict:
+    """The match's winner market only (all pairs() reads), cached EVENT_TTL; stale slugs are dropped on each write
+    (the cache used to keep every match's full event forever -- 11-06 OOM, see winners._pm_event)."""
+    now = time.time()
     hit = _events.get(slug)
-    if hit and time.time() - hit[0] < EVENT_TTL:
+    if hit and now - hit[0] < EVENT_TTL:
         return hit[1]
     ev = http.get(f"{polymarket.GATEWAY}/v1/events/slug/{slug}").get("event") or {}
-    _events[slug] = (time.time(), ev)
+    ev = {"markets": [m for m in ev.get("markets") or [] if m.get("sportsMarketType") == WINNER]}
+    for s in [s for s, (at, _) in list(_events.items()) if now - at >= EVENT_TTL]:
+        _events.pop(s, None)
+    _events[slug] = (now, ev)
     return ev
 
 
