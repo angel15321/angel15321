@@ -613,16 +613,21 @@ class Trigger:
     def __init__(self):
         self._lock = threading.Lock()
         self._dirty: set[str] = set()
+        self._since = 0.0             # when the oldest change not taken yet was marked
+        self.taken_since = 0.0        # ... of the batch take() last returned (0 = it was empty)
         self.event = threading.Event()
 
     def mark(self, key: str) -> None:
         with self._lock:
+            if not self._dirty:
+                self._since = time.time()
             self._dirty.add(key)
         self.event.set()
 
     def take(self) -> set[str]:
         with self._lock:
             d, self._dirty = self._dirty, set()
+            self.taken_since = self._since if d else 0.0
             self.event.clear()
         return d
 
@@ -887,7 +892,10 @@ def _loop_on(db, cfg: Config, brokers: dict, days: float, interval: float, once:
         trig.event.wait(max(0.0, due - t_wait))
         busy_from = lap_at[0] = time.time()
         try:
-            if _on_events(db, cfg, brokers, state, trig.take(), log) == "halt":
+            keys = trig.take()
+            if cfg.maker and trig.taken_since and keys != {SCAN_KEY}:
+                maker.STATE.changed_at = trig.taken_since     # the next live quote check logs how long it waited
+            if _on_events(db, cfg, brokers, state, keys, log) == "halt":
                 next_scan = 0.0                          # the halt check at the top of the loop reports it
         except Exception as e:
             log(f"! event error: {type(e).__name__}: {e}")

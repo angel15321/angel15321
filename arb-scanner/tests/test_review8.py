@@ -91,5 +91,64 @@ class SleepClockTests(Maker):
         self.assertEqual(list(st["due"]), [g.key])
 
 
+class ChangeLagTests(Maker):
+    """What the 60-s line should be judged on: a book changed -> the resting quotes were checked against it."""
+
+    def test_the_trigger_remembers_when_its_oldest_change_arrived(self):
+        t = trader.Trigger()
+        self.assertEqual(t.take(), set())
+        self.assertEqual(t.taken_since, 0.0)
+        t0 = time.time()
+        t.mark("a")
+        time.sleep(0.03)
+        t.mark("b")                                            # a later change does not move the clock
+        self.assertEqual(t.take(), {"a", "b"})
+        self.assertGreaterEqual(t.taken_since, t0)
+        self.assertLess(t.taken_since, t0 + 0.02)
+        self.assertEqual(t.take(), set())
+        self.assertEqual(t.taken_since, 0.0)
+
+    def test_the_guard_logs_how_long_a_change_waited(self):
+        g, pm, k, q = self.posted()
+        maker.STATE.changed_at = time.time() - 0.040
+        with mock.patch.object(trader, "live_book", return_value=None):
+            maker.guard(self.db, self.cfg, self.paper, **QUIET)
+            maker.guard(self.db, self.cfg, self.paper, **QUIET)        # no new change: nothing more is logged
+        self.assertEqual(len(maker.STATE.lags), 1)
+        self.assertAlmostEqual(maker.STATE.lags[0], 0.040, delta=0.02)
+        self.assertEqual(maker.STATE.changed_at, 0.0)
+        line = maker.stats_text()
+        self.assertIn("book change -> quote check:", line)
+        self.assertIn("1 changes", line)
+        self.assertEqual(maker.STATE.lags, [])                         # the 60-s line starts a new count
+
+    def test_the_loop_hands_a_book_change_to_the_guard_and_not_a_scan_wake(self):
+        g, pm, k, q = self.posted()
+        cfg = trader.Config(maker=True, max_per_trade=20, min_profit=0.0, trigger="event")
+        for keys, counted in (({trader.market_key(k)}, 1), ({trader.SCAN_KEY}, 0)):
+            maker.STATE.lags, maker.STATE.changed_at = [], 0.0
+            with tempfile.TemporaryDirectory() as d:
+                cfg.kill_file = os.path.join(d, "STOP")
+                trig = trader.Trigger()
+                ticks = []
+
+                def tick(*a, **kw):
+                    ticks.append(1)
+                    if len(ticks) == 1:
+                        for key in keys:
+                            trig.mark(key)                     # a book changes right after the first scan
+                    open(cfg.kill_file, "w").close()
+
+                with mock.patch.object(polymarket, "_orders", stream({q.oid: NEW})), \
+                        mock.patch.object(trader, "live_book", return_value=None), \
+                        mock.patch.object(trader, "settle"), mock.patch.object(trader, "_tick", side_effect=tick), \
+                        mock.patch.object(trader, "_evaluate_sliced", return_value=None):
+                    trader._loop_on(self.db, cfg, self.paper, 1, 1, False, QUIET["log"], loop_state(g), trig,
+                                    "dry", None)
+            self.assertEqual(len(maker.STATE.lags), counted, keys)
+            if counted:
+                self.assertLess(maker.STATE.lags[0], 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

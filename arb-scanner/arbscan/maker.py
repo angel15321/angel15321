@@ -118,6 +118,8 @@ class State:
     guard_at: float = 0.0     # last live check of the resting quotes (0 = nothing was resting)
     guard_gap: float = 0.0    # longest time between two of them since the last 60-s line: the pull latency we own
     gaps: list = field(default_factory=list)       # every such gap since the last 60-s line (median / 95th for the log)
+    changed_at: float = 0.0   # when the oldest book change not yet checked against the quotes arrived (0 = none)
+    lags: list = field(default_factory=list)       # book change -> live quote check, s: the pull latency itself
     net: dict = field(default_factory=lambda: {"cancel": 0.0, "post": 0.0, "read": 0.0})   # s in Polymarket calls
     suspects: list = field(default_factory=list)   # posts that came back as an error: may rest all the same
     sweep_at: float = 0.0
@@ -428,6 +430,10 @@ def guard(db, cfg, brokers, log):
         if len(s.gaps) < 100_000:
             s.gaps.append(now - s.guard_at)
     s.guard_at = now
+    if s.changed_at:
+        if len(s.lags) < 100_000:
+            s.lags.append(max(0.0, now - s.changed_at))
+        s.changed_at = 0.0
     for q in list(s.quotes.values()):
         if q.dead or q.pm is None or q.k is None:
             continue
@@ -982,7 +988,7 @@ def stats_text() -> str:
            + (f" · NOT QUOTING: {hours.text()}" if hours.text() else "")
            + (f" · PAUSED: {STATE.paused}" if STATE.paused else ""))
     STATE.stats = {k: 0 for k in s}
-    STATE.guard_gap, STATE.gaps = 0.0, []
+    STATE.guard_gap, STATE.gaps, STATE.lags = 0.0, [], []
     STATE.net = {k: 0.0 for k in STATE.net}
     return out
 
@@ -994,6 +1000,12 @@ def _gap_text() -> str:
     if not g:
         return ""
     n = STATE.net
-    return (f" · quotes checked live every {g[len(g) // 2] * 1000:.0f} ms (median), {g[int(len(g) * 0.95)] * 1000:.0f} ms "
-            f"(95th), at most {g[-1] * 1000:.0f} ms apart · Polymarket calls: cancels {n['cancel']:.1f}s, posts "
-            f"{n['post']:.1f}s, order reads {n['read']:.1f}s")
+    lag = sorted(STATE.lags)
+    # The latency that matters: a book changed -> our quotes were checked against it. (The gap between two checks
+    # is long whenever no book moves and the loop sleeps: it only bounds the latency from above.)
+    waited = (f" · book change -> quote check: {lag[len(lag) // 2] * 1000:.1f} ms (median), "
+              f"{lag[int(len(lag) * 0.95)] * 1000:.1f} ms (95th), {lag[-1] * 1000:.0f} ms worst, {len(lag):,} changes"
+              if lag else "")
+    return (waited + f" · quotes checked live every {g[len(g) // 2] * 1000:.0f} ms (median), "
+            f"{g[int(len(g) * 0.95)] * 1000:.0f} ms (95th), at most {g[-1] * 1000:.0f} ms apart · Polymarket calls: "
+            f"cancels {n['cancel']:.1f}s, posts {n['post']:.1f}s, order reads {n['read']:.1f}s")
