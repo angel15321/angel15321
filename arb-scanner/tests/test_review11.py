@@ -174,7 +174,6 @@ class TestPool(unittest.TestCase):
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     peers = set()
-    hang_up = False          # True: close the TCP connection after this reply without saying so (an idle close)
 
     def do_GET(self):
         Handler.peers.add(self.client_address[1])
@@ -183,7 +182,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        if Handler.hang_up:
+        if self.headers.get("X-Hang-Up"):        # close the TCP connection after this reply without saying so
             self.close_connection = True
 
     def log_message(self, *a):
@@ -203,7 +202,7 @@ class TestRealSockets(unittest.TestCase):
     """Real loopback connections: reuse works, and a server-side close is seen before the next send."""
 
     def setUp(self):
-        Handler.peers, Handler.hang_up = set(), False
+        Handler.peers = set()
         Server.closed = threading.Event()
         self.srv = Server(("127.0.0.1", 0), Handler)
         self.srv.daemon_threads = True
@@ -228,9 +227,7 @@ class TestRealSockets(unittest.TestCase):
         self.assertEqual(len(Handler.peers), 1)                           # one TCP connection for three calls
         conn = self.pool._free[-1][0]
         self.assertFalse(keepalive.dropped(conn))
-        Handler.hang_up = True
-        self.assertEqual(self.pool.request("GET", "/x")[0], 200)          # the server closes after this reply
-        Handler.hang_up = False
+        self.assertEqual(self.pool.request("GET", "/x", headers={"X-Hang-Up": "1"})[0], 200)   # server closes after it
         conn = self.pool._free[-1][0]
         self.assertTrue(Server.closed.wait(5))                            # the server side is closed now
         for _ in range(500):                                              # and its FIN reaches our socket
@@ -327,6 +324,8 @@ class TestBrokers(unittest.TestCase):
         k = object.__new__(brokers.KalshiBroker)
         k.base = brokers.KALSHI_TRADE_API
         self.assertEqual(brokers._pool(k).prefix, "/trade-api/v2")
+        self.assertEqual(brokers._pool(k).idle_max, keepalive.KALSHI_IDLE_MAX)   # Kalshi drops idle ones at 30-60 s
+        self.assertEqual(p1.idle_max, keepalive.IDLE_MAX)
 
 
 if __name__ == "__main__":

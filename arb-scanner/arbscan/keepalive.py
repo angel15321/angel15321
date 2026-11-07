@@ -21,7 +21,8 @@ import threading
 import time
 import urllib.parse
 
-IDLE_MAX = 50.0          # s a free connection may sit before it is dropped instead of reused
+IDLE_MAX = 50.0          # s a free connection may sit before it is dropped instead of reused (Polymarket: alive at 120 s)
+KALSHI_IDLE_MAX = 25.0   # Kalshi closes idle connections between 30 and 60 s (box 11-07): stay well under 30
 MAX_FREE = 8             # free connections kept per pool (6 maker workers + the trading thread + one spare)
 
 

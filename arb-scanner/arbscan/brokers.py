@@ -71,7 +71,8 @@ def _pool(broker) -> keepalive.Pool:
     """The broker's reused-connection pool for its base URL (made on first use; a changed base gets a new one)."""
     pool = getattr(broker, "_http_pool", None)
     if pool is None or getattr(pool, "for_base", None) != broker.base:
-        pool = keepalive.Pool(broker.base)
+        idle = keepalive.KALSHI_IDLE_MAX if broker.venue == "Kalshi" else keepalive.IDLE_MAX
+        pool = keepalive.Pool(broker.base, idle_max=idle)
         pool.for_base = broker.base
         broker._http_pool = pool
     return pool
