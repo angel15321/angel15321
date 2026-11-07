@@ -28,12 +28,10 @@ import json
 import math
 import os
 import time
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
 
-from . import scanner
+from . import keepalive, scanner
 from .model import Contract
 
 KALSHI_TRADE_API = "https://external-api.kalshi.com/trade-api/v2"
@@ -67,6 +65,16 @@ class Fill:
         d = asdict(self)
         d["raw"] = {k: v for k, v in self.raw.items() if isinstance(v, (str, int, float, bool, type(None)))}
         return d
+
+
+def _pool(broker) -> keepalive.Pool:
+    """The broker's reused-connection pool for its base URL (made on first use; a changed base gets a new one)."""
+    pool = getattr(broker, "_http_pool", None)
+    if pool is None or getattr(pool, "for_base", None) != broker.base:
+        pool = keepalive.Pool(broker.base)
+        pool.for_base = broker.base
+        broker._http_pool = pool
+    return pool
 
 
 def floor_to(x: float, step: float) -> float:
@@ -214,17 +222,16 @@ class KalshiBroker:
                 "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode()}
 
     def _req(self, method: str, endpoint: str, body: dict | None = None) -> dict:
-        url = self.base + endpoint
         path = "/trade-api/v2" + endpoint
         headers = {"Content-Type": "application/json", "Accept": "application/json", **self._sign(method, path)}
-        req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
-                                     headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:500]
-            raise RuntimeError(f"Kalshi {method} {endpoint} → HTTP {e.code}: {detail}") from None
+        data = json.dumps(body).encode() if body is not None else None
+        # One reused connection per call (keepalive.Pool). Only reads are retried after a dropped connection:
+        # an order POST that fails goes up as before and is booked as a failed hedge, never sent twice.
+        status, raw = _pool(self).request(method, endpoint, data, headers, retry=method == "GET")
+        if status >= 400:
+            detail = raw.decode(errors="replace")[:500]
+            raise RuntimeError(f"Kalshi {method} {endpoint} → HTTP {status}: {detail}")
+        return json.loads(raw)
 
     shards: dict[int, float] | None = None   # exchange shard -> $, from the last balance() read
 
@@ -324,14 +331,15 @@ class PolymarketBroker:
     def _req(self, method: str, path: str, body: dict | None = None) -> dict:
         headers = {"Content-Type": "application/json", "Accept": "application/json",
                    "User-Agent": "nfl-arbscan/2.0", **self._sign(method, path)}
-        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
-                                     headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:500]
-            raise RuntimeError(f"Polymarket {method} {path} → HTTP {e.code}: {detail}") from None
+        data = json.dumps(body).encode() if body is not None else None
+        # Reused connection (keepalive.Pool). Retried once after a dropped connection only when sending it twice
+        # is harmless: reads and cancels. Posts and modifies are never retried.
+        safe = method == "GET" or path.endswith("/cancel")
+        status, raw = _pool(self).request(method, path, data, headers, retry=safe)
+        if status >= 400:
+            detail = raw.decode(errors="replace")[:500]
+            raise RuntimeError(f"Polymarket {method} {path} → HTTP {status}: {detail}")
+        return json.loads(raw)
 
     def balance(self) -> float:
         b = (self._req("GET", "/v1/account/balances").get("balances") or [{}])[0]
